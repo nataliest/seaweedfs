@@ -2019,6 +2019,11 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 		for k, v := range entry.Extended {
 			// Skip internal SeaweedFS headers
 			if !strings.HasPrefix(k, "xattr-") && !s3_constants.IsSeaweedFSInternalHeader(k) {
+				// Skip S3 Additional Checksum headers here; they are handled
+				// explicitly below with x-amz-checksum-mode gating.
+				if strings.HasPrefix(k, "x-amz-checksum-") {
+					continue
+				}
 				// Support backward compatibility: migrate old non-canonical format to canonical format
 				// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
 				headerKey := k
@@ -2032,6 +2037,21 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 					}
 				}
 				w.Header()[headerKey] = []string{string(v)}
+			}
+		}
+	}
+
+	// Return S3 Additional Checksum headers from entry.Extended.
+	// Per AWS S3 spec: GET always returns stored checksums; HEAD only returns them
+	// when the request includes x-amz-checksum-mode: ENABLED.
+	if entry.Extended != nil {
+		includeChecksums := r.Method != http.MethodHead ||
+			strings.EqualFold(r.Header.Get(s3_constants.AmzChecksumMode), "ENABLED")
+		if includeChecksums {
+			for _, key := range s3_constants.S3ChecksumHeaders {
+				if v, ok := entry.Extended[key]; ok {
+					w.Header().Set(key, string(v))
+				}
 			}
 		}
 	}

@@ -1,6 +1,8 @@
 package s3api
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -257,4 +259,79 @@ func TestPartNumberWithRangeHeader(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSetResponseHeaders_ChecksumHeaders(t *testing.T) {
+	s3a := &S3ApiServer{}
+
+	entry := &filer_pb.Entry{
+		Name: "test-object",
+		Attributes: &filer_pb.FuseAttributes{
+			Mtime:    time.Now().Unix(),
+			FileSize: 100,
+			Mime:     "application/octet-stream",
+		},
+		Extended: map[string][]byte{
+			s3_constants.AmzChecksumSHA256: []byte("n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg="),
+			"X-Amz-Meta-Custom":           []byte("custom-value"),
+		},
+	}
+
+	t.Run("GET always returns checksum", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("GET", "/bucket/key", nil)
+
+		s3a.setResponseHeaders(w, r, entry, 100)
+
+		assert.Equal(t, "n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=",
+			w.Header().Get(s3_constants.AmzChecksumSHA256))
+		// User metadata is stored with lowercase suffix normalization by setResponseHeaders
+		assert.Equal(t, []string{"custom-value"}, w.Header()["X-Amz-Meta-custom"])
+	})
+
+	t.Run("HEAD with checksum-mode ENABLED returns checksum", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("HEAD", "/bucket/key", nil)
+		r.Header.Set(s3_constants.AmzChecksumMode, "ENABLED")
+
+		s3a.setResponseHeaders(w, r, entry, 100)
+
+		assert.Equal(t, "n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=",
+			w.Header().Get(s3_constants.AmzChecksumSHA256))
+	})
+
+	t.Run("HEAD without checksum-mode omits checksum", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("HEAD", "/bucket/key", nil)
+
+		s3a.setResponseHeaders(w, r, entry, 100)
+
+		assert.Empty(t, w.Header().Get(s3_constants.AmzChecksumSHA256),
+			"HEAD without checksum-mode should not return checksum headers")
+		assert.Equal(t, []string{"custom-value"}, w.Header()["X-Amz-Meta-custom"],
+			"user metadata should still be returned")
+	})
+
+	t.Run("multiple checksum algorithms", func(t *testing.T) {
+		multiEntry := &filer_pb.Entry{
+			Name: "test-object",
+			Attributes: &filer_pb.FuseAttributes{
+				Mtime:    time.Now().Unix(),
+				FileSize: 100,
+				Mime:     "application/octet-stream",
+			},
+			Extended: map[string][]byte{
+				s3_constants.AmzChecksumSHA256: []byte("sha256value"),
+				s3_constants.AmzChecksumCRC32:  []byte("crc32value"),
+			},
+		}
+
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("GET", "/bucket/key", nil)
+
+		s3a.setResponseHeaders(w, r, multiEntry, 100)
+
+		assert.Equal(t, "sha256value", w.Header().Get(s3_constants.AmzChecksumSHA256))
+		assert.Equal(t, "crc32value", w.Header().Get(s3_constants.AmzChecksumCRC32))
+	})
 }

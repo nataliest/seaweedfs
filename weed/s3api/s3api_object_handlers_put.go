@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -278,6 +279,14 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			s3a.setSSEResponseHeaders(w, r, sseMetadata)
 		}
 	}
+	// Set S3 Additional Checksum header in PutObject response
+	for _, key := range s3_constants.S3ChecksumHeaders {
+		if v := r.Header.Get(key); v != "" {
+			w.Header().Set(key, v)
+			break
+		}
+	}
+
 	stats_collect.RecordBucketActiveTime(bucket)
 	stats_collect.S3UploadedObjectsCounter.WithLabelValues(bucket).Inc()
 
@@ -293,7 +302,12 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	partOffset := int64(0)
 
 	plaintextHash := md5.New()
-	dataReader = io.TeeReader(dataReader, plaintextHash)
+	checksumHeaderKey, checksumProvidedValue, checksumWriter := detectRequestChecksumAlgorithm(r)
+	if checksumWriter != nil {
+		dataReader = io.TeeReader(dataReader, io.MultiWriter(plaintextHash, checksumWriter))
+	} else {
+		dataReader = io.TeeReader(dataReader, plaintextHash)
+	}
 
 	// Handle all SSE encryption types in a unified manner
 	sseResult, sseErrorCode := s3a.handleAllSSEEncryption(r, dataReader, partOffset)
@@ -443,6 +457,19 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			return "", s3err.ErrBadDigest, SSEResponseMetadata{}
 		}
 	}
+
+	// Validate S3 Additional Checksum for non-chunked uploads.
+	// For chunked uploads the chunked reader already validated the trailing checksum.
+	if checksumWriter != nil && checksumProvidedValue != "" {
+		computedChecksum := base64.StdEncoding.EncodeToString(checksumWriter.Sum(nil))
+		if checksumProvidedValue != computedChecksum {
+			glog.Warningf("putToFiler: S3 checksum verification failed for %s: expected %s, got %s, attempting to cleanup %d orphaned chunks",
+				checksumHeaderKey, checksumProvidedValue, computedChecksum, len(chunkResult.FileChunks))
+			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
+			return "", s3err.ErrBadDigest, SSEResponseMetadata{}
+		}
+	}
+
 	glog.V(4).Infof("putToFiler: Chunked upload SUCCESS - path=%s, chunks=%d, size=%d",
 		filePath, len(chunkResult.FileChunks), chunkResult.TotalSize)
 
@@ -563,6 +590,13 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// Store ETag in Extended attribute for future retrieval (e.g. multipart parts)
 	entry.Extended[s3_constants.ExtETagKey] = []byte(etag)
+
+	// Store S3 Additional Checksum if one was provided/computed
+	if checksumWriter != nil {
+		checksumValue := base64.StdEncoding.EncodeToString(checksumWriter.Sum(nil))
+		entry.Extended[checksumHeaderKey] = []byte(checksumValue)
+		glog.V(3).Infof("putToFiler: stored %s=%s for %s", checksumHeaderKey, checksumValue, filePath)
+	}
 
 	// Set object owner
 	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
@@ -2028,4 +2062,25 @@ func (s3a *S3ApiServer) getStorageClassFromExtended(extended map[string][]byte) 
 		}
 	}
 	return "STANDARD"
+}
+
+// detectRequestChecksumAlgorithm detects an S3 Additional Checksum from the request.
+// For non-chunked uploads, the checksum value is in a request header (e.g., x-amz-checksum-sha256).
+// For chunked uploads, the algorithm is specified via the x-amz-trailer header.
+// Returns: the checksum header key (lowercase), the client-provided base64 value (empty for chunked), and a hash.Hash writer.
+func detectRequestChecksumAlgorithm(r *http.Request) (headerKey string, providedValue string, writer hash.Hash) {
+	for _, key := range s3_constants.S3ChecksumHeaders {
+		if v := r.Header.Get(key); v != "" {
+			algo, _ := extractChecksumAlgorithm(key)
+			return key, v, getCheckSumWriter(algo)
+		}
+	}
+
+	if trailer := r.Header.Get("x-amz-trailer"); trailer != "" {
+		if algo, err := extractChecksumAlgorithm(trailer); err == nil && algo != ChecksumAlgorithmNone {
+			return trailer, "", getCheckSumWriter(algo)
+		}
+	}
+
+	return "", "", nil
 }

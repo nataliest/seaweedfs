@@ -136,6 +136,25 @@ const (
 	SeaweedFSSSES3KeyDataHeader = "X-SeaweedFS-SSE-S3-Key-Data" // Header for passing key data for multipart SSE-S3
 )
 
+// S3 Additional Checksum headers (used for storing/returning checksums)
+const (
+	AmzChecksumCRC32    = "x-amz-checksum-crc32"
+	AmzChecksumCRC32C   = "x-amz-checksum-crc32c"
+	AmzChecksumCRC64NVME = "x-amz-checksum-crc64nvme"
+	AmzChecksumSHA1     = "x-amz-checksum-sha1"
+	AmzChecksumSHA256   = "x-amz-checksum-sha256"
+	AmzChecksumMode     = "X-Amz-Checksum-Mode"
+)
+
+// S3ChecksumHeaders lists all S3 Additional Checksum header keys (lowercase).
+var S3ChecksumHeaders = []string{
+	AmzChecksumCRC32,
+	AmzChecksumCRC32C,
+	AmzChecksumCRC64NVME,
+	AmzChecksumSHA1,
+	AmzChecksumSHA256,
+}
+
 // Non-Standard S3 HTTP request constants
 const (
 	AmzIdentityId = "s3-identity-id"
