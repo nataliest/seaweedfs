@@ -9,6 +9,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/admin/topology"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks/base"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks/util"
 	"github.com/seaweedfs/seaweedfs/weed/worker/types"
@@ -80,16 +82,31 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 	// Analyze volume distribution across servers.
 	// Seed from ActiveTopology so servers with matching disk type but zero
 	// volumes are included in the count and imbalance calculation.
+	// Also collect MaxVolumeCount per server to compute utilization ratios.
 	serverVolumeCounts := make(map[string]int)
+	serverMaxVolumes := make(map[string]int64)
 	if clusterInfo.ActiveTopology != nil {
 		topologyInfo := clusterInfo.ActiveTopology.GetTopologyInfo()
 		if topologyInfo != nil {
+			dcMatchers := wildcard.CompileWildcardMatchers(balanceConfig.DataCenterFilter)
+			rackMatchers := wildcard.CompileWildcardMatchers(balanceConfig.RackFilter)
+			nodeMatchers := wildcard.CompileWildcardMatchers(balanceConfig.NodeFilter)
 			for _, dc := range topologyInfo.DataCenterInfos {
+				if !wildcard.MatchesAnyWildcard(dcMatchers, dc.Id) {
+					continue
+				}
 				for _, rack := range dc.RackInfos {
+					if !wildcard.MatchesAnyWildcard(rackMatchers, rack.Id) {
+						continue
+					}
 					for _, node := range rack.DataNodeInfos {
-						for diskTypeName := range node.DiskInfos {
+						if !wildcard.MatchesAnyWildcard(nodeMatchers, node.Id) {
+							continue
+						}
+						for diskTypeName, diskInfo := range node.DiskInfos {
 							if diskTypeName == diskType {
 								serverVolumeCounts[node.Id] = 0
+								serverMaxVolumes[node.Id] += diskInfo.MaxVolumeCount
 							}
 						}
 					}
@@ -97,7 +114,15 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 			}
 		}
 	}
+	hasLocationFilter := balanceConfig.DataCenterFilter != "" || balanceConfig.RackFilter != "" || balanceConfig.NodeFilter != ""
 	for _, metric := range diskMetrics {
+		if hasLocationFilter {
+			// Only count metrics for servers that passed filtering.
+			// Without this guard, out-of-scope servers are re-introduced.
+			if _, allowed := serverVolumeCounts[metric.Server]; !allowed {
+				continue
+			}
+		}
 		serverVolumeCounts[metric.Server]++
 	}
 
@@ -141,38 +166,62 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 	var results []*types.TaskDetectionResult
 	balanced := false
 
+	// Decide upfront whether all servers have MaxVolumeCount info.
+	// If any server is missing it, fall back to raw counts for ALL servers
+	// to avoid mixing utilization ratios (0.0–1.0) with raw counts.
+	allServersHaveMaxInfo := true
+	for _, server := range sortedServers {
+		if maxVol, ok := serverMaxVolumes[server]; !ok || maxVol <= 0 {
+			allServersHaveMaxInfo = false
+			glog.V(1).Infof("BALANCE [%s]: Server %s is missing MaxVolumeCount info, falling back to raw volume counts for balancing", diskType, server)
+			break
+		}
+	}
+
+	var serverUtilization func(server string, effectiveCount int) float64
+	if allServersHaveMaxInfo {
+		serverUtilization = func(server string, effectiveCount int) float64 {
+			return float64(effectiveCount) / float64(serverMaxVolumes[server])
+		}
+	} else {
+		serverUtilization = func(_ string, effectiveCount int) float64 {
+			return float64(effectiveCount)
+		}
+	}
+
 	for len(results) < maxResults {
 		// Compute effective volume counts with adjustments from planned moves
 		effectiveCounts := make(map[string]int, len(serverVolumeCounts))
-		totalVolumes := 0
 		for server, count := range serverVolumeCounts {
 			effective := count + adjustments[server]
 			if effective < 0 {
 				effective = 0
 			}
 			effectiveCounts[server] = effective
-			totalVolumes += effective
 		}
-		avgVolumesPerServer := float64(totalVolumes) / float64(len(effectiveCounts))
 
-		maxVolumes := 0
-		minVolumes := totalVolumes
+		// Find the most and least utilized servers using utilization ratio
+		// (volumes / maxVolumes) so that servers with higher capacity are
+		// expected to hold proportionally more volumes.
+		maxUtilization := -1.0
+		minUtilization := math.Inf(1)
 		maxServer := ""
 		minServer := ""
 
 		for _, server := range sortedServers {
 			count := effectiveCounts[server]
+			util := serverUtilization(server, count)
 			// Min is calculated across all servers for an accurate imbalance ratio
-			if count < minVolumes {
-				minVolumes = count
+			if util < minUtilization {
+				minUtilization = util
 				minServer = server
 			}
 			// Max is only among non-exhausted servers since we can only move from them
 			if exhaustedServers[server] {
 				continue
 			}
-			if count > maxVolumes {
-				maxVolumes = count
+			if util > maxUtilization {
+				maxUtilization = util
 				maxServer = server
 			}
 		}
@@ -183,15 +232,48 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 			break
 		}
 
-		// Check if imbalance exceeds threshold
-		imbalanceRatio := float64(maxVolumes-minVolumes) / avgVolumesPerServer
+		// Check if utilization imbalance exceeds threshold.
+		// imbalanceRatio is the difference between the most and least utilized
+		// servers, expressed as a fraction of mean utilization.
+		avgUtilization := (maxUtilization + minUtilization) / 2.0
+		var imbalanceRatio float64
+		if avgUtilization > 0 {
+			imbalanceRatio = (maxUtilization - minUtilization) / avgUtilization
+		}
 		if imbalanceRatio <= balanceConfig.ImbalanceThreshold {
 			if len(results) == 0 {
-				glog.Infof("BALANCE [%s]: No tasks created - cluster well balanced. Imbalance=%.1f%% (threshold=%.1f%%). Max=%d volumes on %s, Min=%d on %s, Avg=%.1f",
-					diskType, imbalanceRatio*100, balanceConfig.ImbalanceThreshold*100, maxVolumes, maxServer, minVolumes, minServer, avgVolumesPerServer)
+				glog.Infof("BALANCE [%s]: No tasks created - cluster well balanced. Imbalance=%.1f%% (threshold=%.1f%%). MaxUtil=%.1f%% on %s, MinUtil=%.1f%% on %s",
+					diskType, imbalanceRatio*100, balanceConfig.ImbalanceThreshold*100, maxUtilization*100, maxServer, minUtilization*100, minServer)
 			} else {
 				glog.Infof("BALANCE [%s]: Created %d task(s), cluster now balanced. Imbalance=%.1f%% (threshold=%.1f%%)",
 					diskType, len(results), imbalanceRatio*100, balanceConfig.ImbalanceThreshold*100)
+			}
+			balanced = true
+			break
+		}
+
+		// When the global max and min effective counts differ by at most 1,
+		// no single move can improve balance — it would just swap which server
+		// is min vs max. Stop here to avoid infinite oscillation when the
+		// threshold is unachievable (e.g., 11 vols across 4 servers: best is
+		// 3/3/3/2, imbalance=36%). We scan ALL servers' effective counts so the
+		// check works regardless of whether utilization or raw counts are used.
+		globalMaxCount, globalMinCount := 0, math.MaxInt
+		for _, c := range effectiveCounts {
+			if c > globalMaxCount {
+				globalMaxCount = c
+			}
+			if c < globalMinCount {
+				globalMinCount = c
+			}
+		}
+		if globalMaxCount-globalMinCount <= 1 {
+			if len(results) == 0 {
+				glog.Infof("BALANCE [%s]: No tasks created - cluster as balanced as possible. Imbalance=%.1f%% (threshold=%.1f%%), but max-min diff is %d",
+					diskType, imbalanceRatio*100, balanceConfig.ImbalanceThreshold*100, globalMaxCount-globalMinCount)
+			} else {
+				glog.Infof("BALANCE [%s]: Created %d task(s), cluster as balanced as possible. Imbalance=%.1f%% (threshold=%.1f%%), max-min diff=%d",
+					diskType, len(results), imbalanceRatio*100, balanceConfig.ImbalanceThreshold*100, globalMaxCount-globalMinCount)
 			}
 			balanced = true
 			break
@@ -219,11 +301,13 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 			continue
 		}
 
-		// Plan destination and create task.
-		// On failure, continue to the next volume on the same server rather
-		// than exhausting the entire server — the failure may be per-volume
-		// (e.g., volume not found in topology, AddPendingTask failed).
-		task, destServerID := createBalanceTask(diskType, selectedVolume, clusterInfo)
+		// Create task targeting minServer — the greedy algorithm's natural choice.
+		// Using minServer instead of letting planBalanceDestination independently
+		// pick a destination ensures that the detection loop's effective counts
+		// and the destination selection stay in sync. Without this, the topology's
+		// LoadCount-based scoring can diverge from the adjustment-based effective
+		// counts, causing moves to pile onto one server or oscillate (A→B, B→A).
+		task, destServerID := createBalanceTask(diskType, selectedVolume, clusterInfo, minServer, serverVolumeCounts)
 		if task == nil {
 			glog.V(1).Infof("BALANCE [%s]: Cannot plan task for volume %d on server %s, trying next volume", diskType, selectedVolume.VolumeID, maxServer)
 			continue
@@ -231,10 +315,18 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 
 		results = append(results, task)
 
-		// Adjust effective counts for the next iteration
+		// Adjust effective counts for the next iteration.
 		adjustments[maxServer]--
 		if destServerID != "" {
 			adjustments[destServerID]++
+			// If the destination server wasn't in serverVolumeCounts (e.g., a
+			// server with 0 volumes not seeded from topology), add it so
+			// subsequent iterations include it in effective/average/min/max.
+			if _, exists := serverVolumeCounts[destServerID]; !exists {
+				serverVolumeCounts[destServerID] = 0
+				sortedServers = append(sortedServers, destServerID)
+				sort.Strings(sortedServers)
+			}
 		}
 	}
 
@@ -244,9 +336,13 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 }
 
 // createBalanceTask creates a single balance task for the selected volume.
+// targetServer is the server ID chosen by the detection loop's greedy algorithm.
 // Returns (nil, "") if destination planning fails.
 // On success, returns the task result and the canonical destination server ID.
-func createBalanceTask(diskType string, selectedVolume *types.VolumeHealthMetrics, clusterInfo *types.ClusterInfo) (*types.TaskDetectionResult, string) {
+// allowedServers is the set of servers that passed DC/rack/node filtering in
+// the detection loop. When non-empty, the fallback destination planner is
+// checked against this set so that filter scope cannot leak.
+func createBalanceTask(diskType string, selectedVolume *types.VolumeHealthMetrics, clusterInfo *types.ClusterInfo, targetServer string, allowedServers map[string]int) (*types.TaskDetectionResult, string) {
 	taskID := fmt.Sprintf("balance_vol_%d_%d", selectedVolume.VolumeID, time.Now().UnixNano())
 
 	task := &types.TaskDetectionResult{
@@ -267,10 +363,69 @@ func createBalanceTask(diskType string, selectedVolume *types.VolumeHealthMetric
 		return nil, ""
 	}
 
-	destinationPlan, err := planBalanceDestination(clusterInfo.ActiveTopology, selectedVolume)
+	// Parse replica placement once for use in both scoring and validation.
+	var volumeRP *super_block.ReplicaPlacement
+	if selectedVolume.ExpectedReplicas > 0 && selectedVolume.ExpectedReplicas <= 255 {
+		if parsed, rpErr := super_block.NewReplicaPlacementFromByte(byte(selectedVolume.ExpectedReplicas)); rpErr == nil && parsed.HasReplication() {
+			volumeRP = parsed
+		}
+	}
+
+	var replicas []types.ReplicaLocation
+	if clusterInfo.VolumeReplicaMap != nil {
+		replicas = clusterInfo.VolumeReplicaMap[selectedVolume.VolumeID]
+		if volumeRP != nil && len(replicas) == 0 {
+			glog.V(1).Infof("BALANCE [%s]: No replica locations found for volume %d, skipping placement validation",
+				diskType, selectedVolume.VolumeID)
+		}
+	}
+
+	// Resolve the target server chosen by the detection loop's effective counts.
+	// This keeps destination selection in sync with the greedy algorithm rather
+	// than relying on topology LoadCount which can diverge across iterations.
+	destinationPlan, err := resolveBalanceDestination(clusterInfo.ActiveTopology, selectedVolume, targetServer)
 	if err != nil {
-		glog.Warningf("Failed to plan balance destination for volume %d: %v", selectedVolume.VolumeID, err)
-		return nil, ""
+		// Fall back to score-based planning if the preferred target can't be resolved
+		glog.V(1).Infof("BALANCE [%s]: Cannot resolve target %s for volume %d, falling back to score-based planning: %v",
+			diskType, targetServer, selectedVolume.VolumeID, err)
+		destinationPlan, err = planBalanceDestination(clusterInfo.ActiveTopology, selectedVolume, volumeRP, replicas, allowedServers)
+		if err != nil {
+			glog.Warningf("Failed to plan balance destination for volume %d: %v", selectedVolume.VolumeID, err)
+			return nil, ""
+		}
+	}
+
+	// Verify the resolved destination. If it falls outside the filtered scope
+	// or violates replica placement, fall back to the score-based planner and
+	// pick the best candidate that is actually valid.
+	if !isValidBalanceDestination(destinationPlan, allowedServers, volumeRP, replicas, selectedVolume.Server) {
+		switch {
+		case destinationPlan == nil:
+			glog.V(1).Infof("BALANCE [%s]: Planned destination for volume %d is nil, falling back",
+				diskType, selectedVolume.VolumeID)
+		case !isAllowedBalanceTarget(destinationPlan.TargetNode, allowedServers):
+			glog.V(1).Infof("BALANCE [%s]: Planned destination %s for volume %d is outside filtered scope, falling back",
+				diskType, destinationPlan.TargetNode, selectedVolume.VolumeID)
+		case volumeRP != nil && len(replicas) > 0:
+			glog.V(1).Infof("BALANCE [%s]: Destination %s violates replica placement for volume %d (rp=%03d), falling back",
+				diskType, destinationPlan.TargetNode, selectedVolume.VolumeID, selectedVolume.ExpectedReplicas)
+		}
+
+		destinationPlan, err = planBalanceDestination(clusterInfo.ActiveTopology, selectedVolume, volumeRP, replicas, allowedServers)
+		if err != nil {
+			glog.Warningf("BALANCE [%s]: Failed to plan fallback destination for volume %d: %v", diskType, selectedVolume.VolumeID, err)
+			return nil, ""
+		}
+		if !isValidBalanceDestination(destinationPlan, allowedServers, volumeRP, replicas, selectedVolume.Server) {
+			if destinationPlan == nil {
+				glog.V(1).Infof("BALANCE [%s]: Fallback destination for volume %d is nil",
+					diskType, selectedVolume.VolumeID)
+			} else {
+				glog.V(1).Infof("BALANCE [%s]: Fallback destination %s is not valid for volume %d",
+					diskType, destinationPlan.TargetNode, selectedVolume.VolumeID)
+			}
+			return nil, ""
+		}
 	}
 
 	// Find the actual disk containing the volume on the source server
@@ -350,9 +505,58 @@ func createBalanceTask(diskType string, selectedVolume *types.VolumeHealthMetric
 	return task, destinationPlan.TargetNode
 }
 
-// planBalanceDestination plans the destination for a balance operation
-// This function implements destination planning logic directly in the detection phase
-func planBalanceDestination(activeTopology *topology.ActiveTopology, selectedVolume *types.VolumeHealthMetrics) (*topology.DestinationPlan, error) {
+// resolveBalanceDestination resolves the destination for a balance operation
+// when the target server is already known (chosen by the detection loop's
+// effective volume counts). It finds the appropriate disk and address for the
+// target server in the topology.
+func resolveBalanceDestination(activeTopology *topology.ActiveTopology, selectedVolume *types.VolumeHealthMetrics, targetServer string) (*topology.DestinationPlan, error) {
+	topologyInfo := activeTopology.GetTopologyInfo()
+	if topologyInfo == nil {
+		return nil, fmt.Errorf("no topology info available")
+	}
+
+	// Find the target node in the topology and get its disk info
+	for _, dc := range topologyInfo.DataCenterInfos {
+		for _, rack := range dc.RackInfos {
+			for _, node := range rack.DataNodeInfos {
+				if node.Id != targetServer {
+					continue
+				}
+				// Find an available disk matching the volume's disk type
+				for diskTypeName, diskInfo := range node.DiskInfos {
+					if diskTypeName != selectedVolume.DiskType {
+						continue
+					}
+					if diskInfo.MaxVolumeCount > 0 && diskInfo.VolumeCount >= diskInfo.MaxVolumeCount {
+						continue // disk is full
+					}
+					targetAddress, err := util.ResolveServerAddress(node.Id, activeTopology)
+					if err != nil {
+						return nil, fmt.Errorf("failed to resolve address for target server %s: %v", node.Id, err)
+					}
+					return &topology.DestinationPlan{
+						TargetNode:    node.Id,
+						TargetAddress: targetAddress,
+						TargetDisk:    diskInfo.DiskId,
+						TargetRack:    rack.Id,
+						TargetDC:      dc.Id,
+						ExpectedSize:  selectedVolume.Size,
+					}, nil
+				}
+				return nil, fmt.Errorf("target server %s has no available disk of type %s", targetServer, selectedVolume.DiskType)
+			}
+		}
+	}
+	return nil, fmt.Errorf("target server %s not found in topology", targetServer)
+}
+
+// planBalanceDestination plans the destination for a balance operation using
+// score-based selection. Used as a fallback when the preferred target cannot
+// be resolved, and for single-move scenarios outside the detection loop.
+// rp may be nil when the volume has no replication constraint. When replica
+// locations are known, candidates that would violate placement are filtered
+// out before scoring.
+func planBalanceDestination(activeTopology *topology.ActiveTopology, selectedVolume *types.VolumeHealthMetrics, rp *super_block.ReplicaPlacement, replicas []types.ReplicaLocation, allowedServers map[string]int) (*topology.DestinationPlan, error) {
 	// Get source node information from topology
 	var sourceRack, sourceDC string
 
@@ -401,8 +605,21 @@ func planBalanceDestination(activeTopology *topology.ActiveTopology, selectedVol
 		if disk.DiskType != selectedVolume.DiskType {
 			continue
 		}
+		if !isAllowedBalanceTarget(disk.NodeID, allowedServers) {
+			continue
+		}
+		if rp != nil && len(replicas) > 0 {
+			target := types.ReplicaLocation{
+				DataCenter: disk.DataCenter,
+				Rack:       disk.Rack,
+				NodeID:     disk.NodeID,
+			}
+			if !IsGoodMove(rp, replicas, selectedVolume.Server, target) {
+				continue
+			}
+		}
 
-		score := calculateBalanceScore(disk, sourceRack, sourceDC, selectedVolume.Size)
+		score := calculateBalanceScore(disk, sourceRack, sourceDC, selectedVolume.Size, rp)
 		if score > bestScore {
 			bestScore = score
 			bestDisk = disk
@@ -433,7 +650,9 @@ func planBalanceDestination(activeTopology *topology.ActiveTopology, selectedVol
 // calculateBalanceScore calculates placement score for balance operations.
 // LoadCount reflects pending+assigned tasks on the disk, so we factor it into
 // the utilization estimate to avoid stacking multiple moves onto the same target.
-func calculateBalanceScore(disk *topology.DiskInfo, sourceRack, sourceDC string, volumeSize uint64) float64 {
+// rp may be nil when the volume has no replication constraint; in that case the
+// scorer defaults to preferring cross-rack/DC distribution.
+func calculateBalanceScore(disk *topology.DiskInfo, sourceRack, sourceDC string, volumeSize uint64, rp *super_block.ReplicaPlacement) float64 {
 	if disk.DiskInfo == nil {
 		return 0.0
 	}
@@ -449,15 +668,62 @@ func calculateBalanceScore(disk *topology.DiskInfo, sourceRack, sourceDC string,
 		score += (1.0 - utilization) * 50.0 // Up to 50 points for low utilization
 	}
 
-	// Prefer different racks for better distribution
-	if disk.Rack != sourceRack {
-		score += 30.0
+	// Rack scoring: respect the replication policy.
+	// If replicas must stay on the same rack (SameRackCount > 0 with no
+	// cross-rack requirement), prefer same-rack destinations. Otherwise
+	// prefer different racks for better distribution.
+	sameRack := disk.Rack == sourceRack
+	if rp != nil && rp.DiffRackCount == 0 && rp.SameRackCount > 0 {
+		if sameRack {
+			score += 30.0
+		}
+	} else {
+		if !sameRack {
+			score += 30.0
+		}
 	}
 
-	// Prefer different data centers for better distribution
-	if disk.DataCenter != sourceDC {
-		score += 20.0
+	// DC scoring: same idea. If the policy requires all copies in one DC,
+	// prefer same-DC destinations. Otherwise prefer different DCs.
+	sameDC := disk.DataCenter == sourceDC
+	if rp != nil && rp.DiffDataCenterCount == 0 && (rp.SameRackCount > 0 || rp.DiffRackCount > 0) {
+		if sameDC {
+			score += 20.0
+		}
+	} else {
+		if !sameDC {
+			score += 20.0
+		}
 	}
 
 	return score
 }
+
+func isAllowedBalanceTarget(nodeID string, allowedServers map[string]int) bool {
+	if len(allowedServers) == 0 {
+		return true
+	}
+	_, ok := allowedServers[nodeID]
+	return ok
+}
+
+func isValidBalanceDestination(plan *topology.DestinationPlan, allowedServers map[string]int, rp *super_block.ReplicaPlacement, replicas []types.ReplicaLocation, sourceNodeID string) bool {
+	if plan == nil {
+		return false
+	}
+	if !isAllowedBalanceTarget(plan.TargetNode, allowedServers) {
+		return false
+	}
+	if rp == nil || len(replicas) == 0 {
+		return true
+	}
+
+	target := types.ReplicaLocation{
+		DataCenter: plan.TargetDC,
+		Rack:       plan.TargetRack,
+		NodeID:     plan.TargetNode,
+	}
+	return IsGoodMove(rp, replicas, sourceNodeID, target)
+}
+
+// parseCSVSet splits a comma-separated string into a set of trimmed, non-empty values.

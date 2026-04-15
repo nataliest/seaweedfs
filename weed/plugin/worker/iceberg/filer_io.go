@@ -8,13 +8,17 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go/table"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -23,6 +27,30 @@ import (
 type filerFileEntry struct {
 	Dir   string
 	Entry *filer_pb.Entry
+}
+
+var initGlobalHTTPClientOnce sync.Once
+
+type singleFilerClient struct {
+	client filer_pb.SeaweedFilerClient
+}
+
+func (c singleFilerClient) WithFilerClient(_ bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+	return fn(c.client)
+}
+
+func (c singleFilerClient) AdjustedUrl(location *filer_pb.Location) string {
+	if location == nil {
+		return ""
+	}
+	if location.PublicUrl != "" {
+		return location.PublicUrl
+	}
+	return location.Url
+}
+
+func (c singleFilerClient) GetDataCenter() string {
+	return ""
 }
 
 // listFilerEntries lists all entries in a directory.
@@ -174,15 +202,20 @@ func loadFileByIcebergPath(ctx context.Context, client filer_pb.SeaweedFilerClie
 		return nil, fmt.Errorf("file not found: %s/%s", dir, fileName)
 	}
 
-	// Inline content is available for small files (metadata, manifests, and
-	// manifest lists written by saveFilerFile). Larger files uploaded via S3
-	// are stored as chunks with empty Content — detect this and return a
-	// clear error rather than silently returning empty data.
-	if len(resp.Entry.Content) == 0 && len(resp.Entry.Chunks) > 0 {
-		return nil, fmt.Errorf("file %s/%s is stored in chunks; only inline content is supported", dir, fileName)
+	if len(resp.Entry.Content) > 0 || len(resp.Entry.Chunks) == 0 {
+		return resp.Entry.Content, nil
 	}
 
-	return resp.Entry.Content, nil
+	initGlobalHTTPClientOnce.Do(util_http.InitGlobalHttpClient)
+	reader := filer.NewFileReader(singleFilerClient{client: client}, resp.Entry)
+	if closer, ok := reader.(io.Closer); ok {
+		defer closer.Close()
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read chunked file %s/%s: %w", dir, fileName, err)
+	}
+	return data, nil
 }
 
 // normalizeIcebergPath converts an Iceberg path (which may be an S3 URL, an
@@ -248,9 +281,10 @@ func deleteFilerFile(ctx context.Context, client filer_pb.SeaweedFilerClient, di
 }
 
 // updateTableMetadataXattr updates the table entry's metadata xattr with
-// the new Iceberg metadata. It performs a compare-and-swap: if the stored
-// metadataVersion does not match expectedVersion, it returns
-// errMetadataVersionConflict so the caller can retry.
+// the new Iceberg metadata. It verifies the stored metadataVersion before
+// writing and passes the previous metadata xattr back to the filer as a
+// server-side precondition so concurrent writers fail with a retryable
+// metadata version conflict.
 // newMetadataLocation is the table-relative path to the new metadata file
 // (e.g. "metadata/v3.metadata.json").
 func updateTableMetadataXattr(ctx context.Context, client filer_pb.SeaweedFilerClient, tableDir string, expectedVersion int, newFullMetadata []byte, newMetadataLocation string) error {
@@ -279,13 +313,8 @@ func updateTableMetadataXattr(ctx context.Context, client filer_pb.SeaweedFilerC
 		return fmt.Errorf("unmarshal existing xattr: %w", err)
 	}
 
-	// Compare-and-swap: verify the stored metadataVersion matches what we expect.
-	// NOTE: This is a client-side CAS — two workers could both read the same
-	// version, pass this check, and race at UpdateEntry (last-write-wins).
-	// The proper fix is server-side precondition support on UpdateEntryRequest
-	// (e.g. expect-version or If-Match semantics). Until then, commitWithRetry
-	// with exponential backoff mitigates but does not eliminate the race.
-	// Avoid scheduling concurrent maintenance on the same table.
+	// Verify the stored metadataVersion matches what we expect before issuing
+	// the conditional UpdateEntry request below.
 	versionRaw, ok := internalMeta["metadataVersion"]
 	if !ok {
 		return fmt.Errorf("%w: metadataVersion field missing from xattr", errMetadataVersionConflict)
@@ -336,15 +365,27 @@ func updateTableMetadataXattr(ctx context.Context, client filer_pb.SeaweedFilerC
 		return fmt.Errorf("marshal updated xattr: %w", err)
 	}
 
+	expectedVersionXattr := resp.Entry.Extended[s3tables.ExtendedKeyMetadataVersion]
 	resp.Entry.Extended[s3tables.ExtendedKeyMetadata] = updatedXattr
+	resp.Entry.Extended[s3tables.ExtendedKeyMetadataVersion] = metadataVersionXattr(newVersion)
 	_, err = client.UpdateEntry(ctx, &filer_pb.UpdateEntryRequest{
 		Directory: parentDir,
 		Entry:     resp.Entry,
+		ExpectedExtended: map[string][]byte{
+			s3tables.ExtendedKeyMetadataVersion: expectedVersionXattr,
+		},
 	})
 	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			return fmt.Errorf("%w: table metadata changed during update", errMetadataVersionConflict)
+		}
 		return fmt.Errorf("update table entry: %w", err)
 	}
 	return nil
+}
+
+func metadataVersionXattr(version int) []byte {
+	return []byte(strconv.Itoa(version))
 }
 
 // generateIcebergVersionToken produces a random hex token, mirroring the

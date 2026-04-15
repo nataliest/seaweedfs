@@ -26,6 +26,15 @@ type S3BucketsData struct {
 	TotalBuckets int        `json:"total_buckets"`
 	TotalSize    int64      `json:"total_size"`
 	LastUpdated  time.Time  `json:"last_updated"`
+
+	// Pagination
+	CurrentPage int `json:"current_page"`
+	TotalPages  int `json:"total_pages"`
+	PageSize    int `json:"page_size"`
+
+	// Sorting
+	SortBy    string `json:"sort_by"`
+	SortOrder string `json:"sort_order"`
 }
 
 type CreateBucketRequest struct {
@@ -48,7 +57,7 @@ type CreateBucketRequest struct {
 func (s *AdminServer) ShowS3Buckets(w http.ResponseWriter, r *http.Request) {
 	username := UsernameFromContext(r.Context())
 
-	data, err := s.GetS3BucketsData()
+	data, err := s.GetS3BucketsData(1, 100, "name", "asc")
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "Failed to get Object Store buckets: "+err.Error())
 		return
@@ -350,26 +359,6 @@ func normalizeQuotaUnit(unit string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported quota unit: %s", unit)
 	}
-}
-
-// Helper function to convert bytes to appropriate unit and size
-func convertBytesToQuota(bytes int64) (int64, string) {
-	if bytes == 0 {
-		return 0, "MB"
-	}
-
-	// Convert to TB if >= 1TB
-	if bytes >= 1024*1024*1024*1024 && bytes%(1024*1024*1024*1024) == 0 {
-		return bytes / (1024 * 1024 * 1024 * 1024), "TB"
-	}
-
-	// Convert to GB if >= 1GB
-	if bytes >= 1024*1024*1024 && bytes%(1024*1024*1024) == 0 {
-		return bytes / (1024 * 1024 * 1024), "GB"
-	}
-
-	// Convert to MB (default)
-	return bytes / (1024 * 1024), "MB"
 }
 
 // SetBucketQuota sets the quota for a bucket

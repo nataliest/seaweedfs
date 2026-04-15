@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -177,7 +178,7 @@ func (fs *FilerSink) replicateOneManifestChunk(ctx context.Context, sourceChunk 
 }
 
 func (fs *FilerSink) uploadManifestChunk(path string, sourceMtime int64, sourceFileId string, manifestData []byte) (fileId string, err error) {
-	uploader, err := operation.NewUploader()
+	uploader, err := fs.getUploader()
 	if err != nil {
 		glog.V(0).Infof("upload manifest data %v: %v", sourceFileId, err)
 		return "", fmt.Errorf("upload manifest data: %w", err)
@@ -234,25 +235,65 @@ func (fs *FilerSink) uploadManifestChunk(path string, sourceMtime int64, sourceF
 }
 
 func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string, sourceMtime int64) (fileId string, err error) {
-	uploader, err := operation.NewUploader()
+	uploader, err := fs.getUploader()
 	if err != nil {
 		glog.V(0).Infof("upload source data %v: %v", sourceChunk.GetFileIdString(), err)
 		return "", fmt.Errorf("upload data: %w", err)
 	}
 
+	transferStatus := &ChunkTransferStatus{
+		ChunkFileId: sourceChunk.GetFileIdString(),
+		Path:        path,
+		Status:      "downloading",
+	}
+	fs.activeTransfers.Store(sourceChunk.GetFileIdString(), transferStatus)
+	defer fs.activeTransfers.Delete(sourceChunk.GetFileIdString())
+
 	eofBackoff := time.Duration(0)
+	var partialData []byte
+	var savedFilename string
+	var savedHeader http.Header
+	var savedSourceUrl string
 	retryName := fmt.Sprintf("replicate chunk %s", sourceChunk.GetFileIdString())
 	err = util.RetryUntil(retryName, func() error {
-		filename, header, resp, readErr := fs.filerSource.ReadPart(sourceChunk.GetFileIdString())
+		filename, header, resp, readErr := fs.filerSource.ReadPart(sourceChunk.GetFileIdString(), int64(len(partialData)))
 		if readErr != nil {
 			return fmt.Errorf("read part %s: %w", sourceChunk.GetFileIdString(), readErr)
 		}
 		defer util_http.CloseResponse(resp)
 
-		sourceUrl := ""
-		if resp.Request != nil && resp.Request.URL != nil {
-			sourceUrl = resp.Request.URL.String()
+		// Save metadata from first successful response
+		if len(partialData) == 0 {
+			savedFilename = filename
+			savedHeader = header
+			if resp.Request != nil && resp.Request.URL != nil {
+				savedSourceUrl = resp.Request.URL.String()
+			}
 		}
+
+		// Read the response body
+		data, readBodyErr := io.ReadAll(resp.Body)
+		if readBodyErr != nil {
+			// Keep whatever bytes we received before the error
+			partialData = append(partialData, data...)
+			return fmt.Errorf("read body: %w", readBodyErr)
+		}
+
+		// Combine with previously accumulated partial data
+		var fullData []byte
+		if len(partialData) > 0 {
+			fullData = append(partialData, data...)
+			glog.V(0).Infof("resumed reading %s, got %d + %d = %d bytes",
+				sourceChunk.GetFileIdString(), len(partialData), len(data), len(fullData))
+			partialData = nil
+		} else {
+			fullData = data
+		}
+
+		transferStatus.mu.Lock()
+		transferStatus.BytesReceived = int64(len(fullData))
+		transferStatus.Status = "uploading"
+		transferStatus.mu.Unlock()
 
 		currentFileId, uploadResult, uploadErr, _ := uploader.UploadWithRetry(
 			fs,
@@ -266,20 +307,20 @@ func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string,
 				Path:        path,
 			},
 			&operation.UploadOption{
-				Filename:          filename,
+				Filename:          savedFilename,
 				Cipher:            false,
-				IsInputCompressed: "gzip" == header.Get("Content-Encoding"),
-				MimeType:          header.Get("Content-Type"),
+				IsInputCompressed: "gzip" == savedHeader.Get("Content-Encoding"),
+				MimeType:          savedHeader.Get("Content-Type"),
 				PairMap:           nil,
 				RetryForever:      false,
-				SourceUrl:         sourceUrl,
+				SourceUrl:         savedSourceUrl,
 			},
 			func(host, fileId string) string {
 				fileUrl := fs.buildUploadUrl(host, fileId)
-				glog.V(4).Infof("replicating %s to %s header:%+v", filename, fileUrl, header)
+				glog.V(4).Infof("replicating %s to %s header:%+v", savedFilename, fileUrl, savedHeader)
 				return fileUrl
 			},
-			resp.Body,
+			util.NewBytesReader(fullData),
 		)
 		if uploadErr != nil {
 			return fmt.Errorf("upload data: %w", uploadErr)
@@ -291,17 +332,28 @@ func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string,
 		eofBackoff = 0
 		fileId = currentFileId
 		return nil
-	}, func(uploadErr error) (shouldContinue bool) {
+	}, func(retryErr error) (shouldContinue bool) {
 		if fs.hasSourceNewerVersion(path, sourceMtime) {
-			glog.V(1).Infof("skip retrying stale source %s for %s: %v", sourceChunk.GetFileIdString(), path, uploadErr)
+			glog.V(1).Infof("skip retrying stale source %s for %s: %v", sourceChunk.GetFileIdString(), path, retryErr)
 			return false
 		}
-		if isEofError(uploadErr) {
+		transferStatus.mu.Lock()
+		transferStatus.LastErr = retryErr.Error()
+		transferStatus.mu.Unlock()
+		if isEofError(retryErr) {
 			eofBackoff = nextEofBackoff(eofBackoff)
-			glog.V(0).Infof("source connection interrupted while replicating %s for %s, backing off %v: %v", sourceChunk.GetFileIdString(), path, eofBackoff, uploadErr)
+			transferStatus.mu.Lock()
+			transferStatus.BytesReceived = int64(len(partialData))
+			transferStatus.Status = fmt.Sprintf("waiting %v", eofBackoff)
+			transferStatus.mu.Unlock()
+			glog.V(0).Infof("source connection interrupted while replicating %s for %s (%d bytes received so far), backing off %v: %v",
+				sourceChunk.GetFileIdString(), path, len(partialData), eofBackoff, retryErr)
 			time.Sleep(eofBackoff)
+			transferStatus.mu.Lock()
+			transferStatus.Status = "downloading"
+			transferStatus.mu.Unlock()
 		} else {
-			glog.V(0).Infof("replicate %s for %s: %v", sourceChunk.GetFileIdString(), path, uploadErr)
+			glog.V(0).Infof("replicate %s for %s: %v", sourceChunk.GetFileIdString(), path, retryErr)
 		}
 		return true
 	})

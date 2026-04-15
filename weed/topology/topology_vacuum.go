@@ -67,9 +67,7 @@ func (t *Topology) batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vid ne
 
 func (t *Topology) batchVacuumVolumeCompact(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId,
 	locationlist *VolumeLocationList, preallocate int64) bool {
-	vl.accessLock.Lock()
-	vl.removeFromWritable(vid)
-	vl.accessLock.Unlock()
+	vl.DrainAndRemoveFromWritable(vid)
 
 	ch := make(chan bool, locationlist.Length())
 	for index, dn := range locationlist.list {
@@ -250,11 +248,11 @@ func (t *Topology) Vacuum(grpcDialOption grpc.DialOption, garbageThreshold float
 					t.vacuumOneVolumeLayout(grpcDialOption, volumeLayout, c, garbageThreshold, maxParallelVacuumPerServer, preallocate, automatic)
 				}
 			}
-			if automatic && t.isDisableVacuum {
+			if automatic && t.IsVacuumDisabled() {
 				break
 			}
 		}
-		if automatic && t.isDisableVacuum {
+		if automatic && t.IsVacuumDisabled() {
 			glog.V(0).Infof("Vacuum is disabled")
 			break
 		}
@@ -321,11 +319,11 @@ func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeL
 					limiterLock.Unlock()
 				}
 			})
-			if automatic && t.isDisableVacuum {
+			if automatic && t.IsVacuumDisabled() {
 				break
 			}
 		}
-		if automatic && t.isDisableVacuum {
+		if automatic && t.IsVacuumDisabled() {
 			break
 		}
 		if len(todoVolumeMap) == len(pendingVolumeMap) {

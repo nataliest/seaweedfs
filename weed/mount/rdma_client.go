@@ -119,13 +119,6 @@ func (c *RDMAMountClient) lookupVolumeLocationByFileID(ctx context.Context, file
 	return bestAddress, nil
 }
 
-// lookupVolumeLocation finds the best volume server for a given volume ID (legacy method)
-func (c *RDMAMountClient) lookupVolumeLocation(ctx context.Context, volumeID uint32, needleID uint64, cookie uint32) (string, error) {
-	// Create a file ID for lookup (format: volumeId,needleId,cookie)
-	fileID := fmt.Sprintf("%d,%x,%d", volumeID, needleID, cookie)
-	return c.lookupVolumeLocationByFileID(ctx, fileID)
-}
-
 // healthCheck verifies that the RDMA sidecar is available and functioning
 func (c *RDMAMountClient) healthCheck() error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
@@ -226,6 +219,7 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 
 	var data []byte
 
+	var n int
 	if useTempFile && tempFilePath != "" {
 		// Zero-copy path: read from temp file (page cache)
 		glog.V(4).Infof("🔥 Using zero-copy temp file: %s", tempFilePath)
@@ -237,7 +231,7 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 		}
 		buffer := make([]byte, bufferSize)
 
-		n, err := c.readFromTempFile(tempFilePath, buffer)
+		n, err = c.readFromTempFile(tempFilePath, buffer)
 		if err != nil {
 			glog.V(2).Infof("Zero-copy failed, falling back to HTTP body: %v", err)
 			// Fall back to reading HTTP body

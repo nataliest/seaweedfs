@@ -43,6 +43,7 @@ var (
 	multipartActionSet = map[string]bool{
 		s3const.S3_ACTION_CREATE_MULTIPART:       true,
 		s3const.S3_ACTION_UPLOAD_PART:            true,
+		s3const.S3_ACTION_UPLOAD_PART_COPY:       true,
 		s3const.S3_ACTION_COMPLETE_MULTIPART:     true,
 		s3const.S3_ACTION_ABORT_MULTIPART:        true,
 		s3const.S3_ACTION_LIST_PARTS:             true,
@@ -82,14 +83,27 @@ func (s StringOrStringSlice) MarshalJSON() ([]byte, error) {
 	return json.Marshal(s.values)
 }
 
-// Strings returns the slice of strings
-func (s StringOrStringSlice) Strings() []string {
+// Strings returns the slice of strings. Nil-safe for pointer receivers.
+func (s *StringOrStringSlice) Strings() []string {
+	if s == nil {
+		return nil
+	}
 	return s.values
 }
 
 // NewStringOrStringSlice creates a new StringOrStringSlice from strings
 func NewStringOrStringSlice(values ...string) StringOrStringSlice {
 	return StringOrStringSlice{values: values}
+}
+
+// NewStringOrStringSlicePtr creates a new *StringOrStringSlice from strings
+func NewStringOrStringSlicePtr(values ...string) *StringOrStringSlice {
+	return &StringOrStringSlice{values: values}
+}
+
+// CloneStringOrStringSlice returns a copy with its own backing slice.
+func CloneStringOrStringSlice(value StringOrStringSlice) StringOrStringSlice {
+	return StringOrStringSlice{values: append([]string(nil), value.values...)}
 }
 
 // PolicyConditions represents policy conditions with proper typing
@@ -138,8 +152,8 @@ type PolicyStatement struct {
 	Effect      PolicyEffect         `json:"Effect"`
 	Principal   *StringOrStringSlice `json:"Principal,omitempty"`
 	Action      StringOrStringSlice  `json:"Action"`
-	Resource    StringOrStringSlice  `json:"Resource,omitempty"`
-	NotResource StringOrStringSlice  `json:"NotResource,omitempty"`
+	Resource    *StringOrStringSlice `json:"Resource,omitempty"`
+	NotResource *StringOrStringSlice `json:"NotResource,omitempty"`
 	Condition   PolicyConditions     `json:"Condition,omitempty"`
 }
 
@@ -164,6 +178,10 @@ type PolicyEvaluationArgs struct {
 	ObjectEntry map[string][]byte
 	// Claims are JWT claims for jwt:* policy variables (can be nil)
 	Claims map[string]interface{}
+	// InheritedSSEAlgorithm is the canonical SSE algorithm ("AES256" or "aws:kms")
+	// inherited from the CreateMultipartUpload request for UploadPart and
+	// UploadPartCopy actions. The empty string means no SSE was used.
+	InheritedSSEAlgorithm string
 }
 
 // PolicyCache for caching compiled policies
@@ -296,8 +314,16 @@ func compileStatement(stmt *PolicyStatement) (*CompiledStatement, error) {
 	}
 
 	// Deep clone Resource/NotResource into the internal statement as well for completeness
-	compiled.Statement.Resource.values = slices.Clone(stmt.Resource.values)
-	compiled.Statement.NotResource.values = slices.Clone(stmt.NotResource.values)
+	if stmt.Resource != nil {
+		resourceClone := *stmt.Resource
+		resourceClone.values = slices.Clone(stmt.Resource.values)
+		compiled.Statement.Resource = &resourceClone
+	}
+	if stmt.NotResource != nil {
+		notResourceClone := *stmt.NotResource
+		notResourceClone.values = slices.Clone(stmt.NotResource.values)
+		compiled.Statement.NotResource = &notResourceClone
+	}
 	compiled.Statement.Action.values = slices.Clone(stmt.Action.values)
 
 	// Deep clone Condition map
@@ -448,6 +474,8 @@ func normalizeToStringSliceWithError(value interface{}) ([]string, error) {
 		return result, nil
 	case StringOrStringSlice:
 		return v.Strings(), nil
+	case *StringOrStringSlice:
+		return v.Strings(), nil
 	default:
 		return nil, fmt.Errorf("unexpected type for policy value: %T", v)
 	}
@@ -461,11 +489,6 @@ func GetBucketFromResource(resource string) string {
 		return parts[0]
 	}
 	return ""
-}
-
-// IsObjectResource checks if resource refers to objects
-func IsObjectResource(resource string) bool {
-	return strings.Contains(resource, "/")
 }
 
 // MatchesAction checks if an action matches any of the compiled action matchers.

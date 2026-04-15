@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -43,9 +45,11 @@ type Topology struct {
 
 	pulse int64
 
-	volumeSizeLimit  uint64
-	replicationAsMin bool
-	isDisableVacuum  bool
+	volumeSizeLimit          uint64
+	replicationAsMin         bool
+	vacuumDisabledByOperator atomic.Bool // true when operator manually disables vacuum
+	vacuumDisabledByPlugin   atomic.Bool // true when disabled by the vacuum plugin monitor
+	adminServerConnectedFunc func() bool // optional callback to check admin server presence
 
 	Sequence sequence.Sequencer
 
@@ -316,7 +320,11 @@ func (t *Topology) NextVolumeId() (needle.VolumeId, error) {
 	return next, nil
 }
 
-func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption, volumeLayout *VolumeLayout) (fileId string, count uint64, volumeLocationList *VolumeLocationList, shouldGrow bool, err error) {
+// DefaultNeedleSizeEstimate is the fallback per-file-ID size estimate when
+// the client does not provide an expected data size.
+const DefaultNeedleSizeEstimate uint64 = 1024 * 1024 // 1 MB
+
+func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption, volumeLayout *VolumeLayout, expectedDataSize uint64) (fileId string, count uint64, volumeLocationList *VolumeLocationList, shouldGrow bool, err error) {
 	var vid needle.VolumeId
 	vid, count, volumeLocationList, shouldGrow, err = volumeLayout.PickForWrite(requestedCount, option)
 	if err != nil {
@@ -325,6 +333,14 @@ func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption,
 	if volumeLocationList == nil || volumeLocationList.Length() == 0 {
 		return "", 0, nil, shouldGrow, fmt.Errorf("%s available for collection:%s replication:%s ttl:%s", NoWritableVolumes, option.Collection, option.ReplicaPlacement.String(), option.Ttl.String())
 	}
+	// Track estimated assigned bytes to spread load between heartbeats.
+	// Use the client hint if provided, otherwise fall back to 1MB estimate.
+	sizePerFile := DefaultNeedleSizeEstimate
+	if expectedDataSize > 0 {
+		sizePerFile = expectedDataSize
+	}
+	pendingBytes := min(uint64(count)*sizePerFile, uint64(math.MaxInt64))
+	volumeLayout.RecordAssign(vid, int64(pendingBytes))
 	nextFileId := t.Sequence.NextFileId(requestedCount)
 	fileId = needle.NewFileId(vid, nextFileId, rand.Uint32()).String()
 	return fileId, count, volumeLocationList, shouldGrow, nil
@@ -482,6 +498,15 @@ func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformati
 		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
 		vl.EnsureCorrectWritables(&v)
 	}
+	// Update effective sizes for all reported volumes (decay pending estimates)
+	for _, v := range volumeInfos {
+		if v.ReplicaPlacement == nil {
+			continue
+		}
+		diskType := types.ToDiskType(v.DiskType)
+		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
+		vl.UpdateVolumeSize(v.Id, v.Size, v.CompactRevision)
+	}
 	return
 }
 
@@ -526,14 +551,49 @@ func (t *Topology) DataNodeRegistration(dcName, rackName string, dn *DataNode) {
 	glog.Infof("[%s] reLink To topo  ", dn.Id())
 }
 
-func (t *Topology) DisableVacuum() {
-	glog.V(0).Infof("DisableVacuum")
-	t.isDisableVacuum = true
+// IsVacuumDisabled returns true if vacuum is disabled by either the
+// operator or the plugin monitor.
+func (t *Topology) IsVacuumDisabled() bool {
+	return t.vacuumDisabledByOperator.Load() || t.vacuumDisabledByPlugin.Load()
 }
 
+// DisableVacuum is called by the operator (shell command / manual RPC).
+// Only sets the operator flag; does not affect the plugin flag.
+func (t *Topology) DisableVacuum() {
+	glog.V(0).Infof("DisableVacuum (by operator)")
+	t.vacuumDisabledByOperator.Store(true)
+}
+
+// EnableVacuum is called by the operator (shell command / manual RPC).
+// Only clears the operator flag; does not affect the plugin flag.
 func (t *Topology) EnableVacuum() {
-	glog.V(0).Infof("EnableVacuum")
-	t.isDisableVacuum = false
+	glog.V(0).Infof("EnableVacuum (by operator)")
+	t.vacuumDisabledByOperator.Store(false)
+}
+
+// DisableVacuumByPlugin is called by the admin server's vacuum monitor
+// when a vacuum plugin worker connects. Only sets the plugin flag.
+func (t *Topology) DisableVacuumByPlugin() {
+	glog.V(0).Infof("DisableVacuum (by plugin worker)")
+	t.vacuumDisabledByPlugin.Store(true)
+}
+
+// EnableVacuumByPlugin is called by the admin server's vacuum monitor
+// when a vacuum plugin worker disconnects. Only clears the plugin flag.
+func (t *Topology) EnableVacuumByPlugin() {
+	glog.V(0).Infof("EnableVacuum (by plugin worker)")
+	t.vacuumDisabledByPlugin.Store(false)
+}
+
+// IsVacuumDisabledByPlugin returns whether the plugin monitor has disabled vacuum.
+func (t *Topology) IsVacuumDisabledByPlugin() bool {
+	return t.vacuumDisabledByPlugin.Load()
+}
+
+// SetAdminServerConnectedFunc sets an optional callback used by the vacuum
+// safety net to detect when the admin server has disconnected.
+func (t *Topology) SetAdminServerConnectedFunc(f func() bool) {
+	t.adminServerConnectedFunc = f
 }
 
 func (t *Topology) GetTopologyId() string {

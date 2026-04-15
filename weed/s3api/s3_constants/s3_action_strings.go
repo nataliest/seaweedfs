@@ -8,7 +8,7 @@ const (
 	S3_ACTION_PUT_OBJECT            = "s3:PutObject"
 	S3_ACTION_DELETE_OBJECT         = "s3:DeleteObject"
 	S3_ACTION_DELETE_OBJECT_VERSION = "s3:DeleteObjectVersion"
-	S3_ACTION_GET_OBJECT_VERSION     = "s3:GetObjectVersion"
+	S3_ACTION_GET_OBJECT_VERSION    = "s3:GetObjectVersion"
 	S3_ACTION_GET_OBJECT_ATTRIBUTES = "s3:GetObjectAttributes"
 
 	// Object ACL operations
@@ -32,6 +32,7 @@ const (
 	S3_ACTION_UPLOAD_PART            = "s3:UploadPart"
 	S3_ACTION_COMPLETE_MULTIPART     = "s3:CompleteMultipartUpload"
 	S3_ACTION_ABORT_MULTIPART        = "s3:AbortMultipartUpload"
+	S3_ACTION_UPLOAD_PART_COPY       = "s3:UploadPartCopy"
 	S3_ACTION_LIST_PARTS             = "s3:ListMultipartUploadParts"
 	S3_ACTION_LIST_MULTIPART_UPLOADS = "s3:ListBucketMultipartUploads"
 

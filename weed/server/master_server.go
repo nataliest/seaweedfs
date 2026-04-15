@@ -88,6 +88,8 @@ type MasterServer struct {
 
 	Cluster *cluster.Cluster
 
+	LockRingManager *cluster.LockRingManager
+
 	// telemetry
 	telemetryCollector *telemetry.Collector
 }
@@ -138,6 +140,8 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		Cluster:                 cluster.NewCluster(),
 	}
 
+	ms.LockRingManager = cluster.NewLockRingManager(ms.broadcastToClients)
+
 	ms.MasterClient.SetOnPeerUpdateFn(ms.OnPeerUpdate)
 
 	seq := ms.createSequencer(option)
@@ -185,6 +189,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		r.HandleFunc("/{fileId}", requestIDMiddleware(ms.redirectHandler))
 	}
 
+	ms.Topo.SetAdminServerConnectedFunc(ms.isAdminServerConnectedFunc)
 	ms.Topo.StartRefreshWritableVolumes(
 		ms.grpcDialOption,
 		ms.option.GarbageThreshold,
@@ -199,6 +204,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.startAdminScripts()
 	}
 
+	stats.MasterStartTimeSeconds.Set(float64(time.Now().Unix()))
 	return ms
 }
 
@@ -296,11 +302,28 @@ func (ms *MasterServer) ensureTopologyId() {
 	currentId := ms.Topo.GetTopologyId()
 	glog.V(1).Infof("ensureTopologyId: current TopologyId after barrier: %s", currentId)
 
+	prevId := ms.Topo.GetTopologyId()
+
 	EnsureTopologyId(ms.Topo, func() bool {
 		return ms.Topo.IsLeader()
 	}, func(topologyId string) error {
 		return ms.syncRaftForTopologyId(topologyId)
 	})
+
+	// If a new TopologyId was generated, take a snapshot so it survives
+	// raft state cleanup on future non-resume restarts.
+	if prevId == "" && ms.Topo.GetTopologyId() != "" {
+		ms.Topo.RaftServerAccessLock.RLock()
+		if ms.Topo.RaftServer != nil {
+			if err := ms.Topo.RaftServer.TakeSnapshot(); err != nil {
+				glog.Warningf("snapshot after TopologyId generation: %v", err)
+			} else {
+				glog.V(0).Infof("snapshot taken to persist TopologyId %s", ms.Topo.GetTopologyId())
+			}
+		}
+		// Hashicorp raft snapshots are handled automatically.
+		ms.Topo.RaftServerAccessLock.RUnlock()
+	}
 }
 
 func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
@@ -336,7 +359,7 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (ms *MasterServer) isAdminServerConnected() bool {
+func (ms *MasterServer) isAdminServerConnectedFunc() bool {
 	if ms == nil || ms.adminLocks == nil {
 		return false
 	}
@@ -383,7 +406,7 @@ func (ms *MasterServer) startAdminScripts() {
 		for {
 			time.Sleep(time.Duration(sleepMinutes) * time.Minute)
 			if ms.Topo.IsLeader() && ms.MasterClient.GetMaster(context.Background()) != "" {
-				if ms.isAdminServerConnected() {
+				if ms.isAdminServerConnectedFunc() {
 					glog.V(1).Infof("Skipping master maintenance scripts because admin server is connected")
 					continue
 				}

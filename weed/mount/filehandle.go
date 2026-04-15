@@ -4,6 +4,8 @@ import (
 	"os"
 	"sync"
 
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -24,12 +26,23 @@ type FileHandle struct {
 	wfs             *WFS
 
 	// cache file has been written to
-	dirtyMetadata bool
-	dirtyPages    *PageWriter
-	reader        *filer.ChunkReadAt
-	contentType   string
+	dirtyMetadata     bool
+	dirtyPages        *PageWriter
+	reader            *filer.ChunkReadAt
+	contentType       string
+	asyncFlushPending bool   // set in writebackCache mode to defer flush to Release
+	asyncFlushUid     uint32 // saved uid for deferred metadata flush
+	asyncFlushGid     uint32 // saved gid for deferred metadata flush
+	savedDir          string // last known parent path if inode-to-path state is forgotten
+	savedName         string // last known file name if inode-to-path state is forgotten
 
 	isDeleted bool
+	isRenamed bool // set by Rename before waiting for async flush; skips old-path metadata flush
+
+	// dlmLock holds the distributed lock for cross-mount write coordination.
+	// Non-nil only when -dlm is enabled and the file was opened for writing.
+	// Acquired in AcquireHandle, released in ReleaseHandle.
+	dlmLock *cluster.LiveLock
 
 	// RDMA chunk offset cache for performance optimization
 	chunkOffsetCache []int64
@@ -68,8 +81,20 @@ func newFileHandle(wfs *WFS, handleId FileHandleId, inode uint64, entry *filer_p
 }
 
 func (fh *FileHandle) FullPath() util.FullPath {
-	fp, _ := fh.wfs.inodeToPath.GetPath(fh.inode)
-	return fp
+	if fp, status := fh.wfs.inodeToPath.GetPath(fh.inode); status == fuse.OK {
+		return fp
+	}
+	if fh.savedName != "" {
+		return util.FullPath(fh.savedDir).Child(fh.savedName)
+	}
+	return ""
+}
+
+func (fh *FileHandle) RememberPath(fullPath util.FullPath) {
+	if fullPath == "" {
+		return
+	}
+	fh.savedDir, fh.savedName = fullPath.DirAndName()
 }
 
 func (fh *FileHandle) GetEntry() *LockedEntry {
@@ -94,6 +119,13 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 	fh.invalidateChunkCache()
 }
 
+func (fh *FileHandle) ResetDirtyPages() {
+	fh.dirtyPages.Destroy()
+	fh.dirtyPages = newPageWriter(fh, fh.wfs.option.ChunkSizeLimit)
+	fh.dirtyMetadata = false
+	fh.contentType = ""
+}
+
 func (fh *FileHandle) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Entry {
 	result := fh.entry.UpdateEntry(fn)
 
@@ -111,6 +143,13 @@ func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
 }
 
 func (fh *FileHandle) ReleaseHandle() {
+	// Release distributed lock before cleaning up, so other mounts can
+	// proceed as soon as this handle is done flushing.
+	if fh.dlmLock != nil {
+		fh.dlmLock.Stop()
+		fh.dlmLock = nil
+		glog.V(1).Infof("DLM lock released for inode %d", fh.inode)
+	}
 
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("ReleaseHandle", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
@@ -119,13 +158,6 @@ func (fh *FileHandle) ReleaseHandle() {
 	if IsDebugFileReadWrite {
 		fh.mirrorFile.Close()
 	}
-}
-
-func lessThan(a, b *filer_pb.FileChunk) bool {
-	if a.ModifiedTsNs == b.ModifiedTsNs {
-		return a.Fid.FileKey < b.Fid.FileKey
-	}
-	return a.ModifiedTsNs < b.ModifiedTsNs
 }
 
 // getCumulativeOffsets returns cached cumulative offsets for chunks, computing them if necessary

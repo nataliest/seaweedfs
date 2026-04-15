@@ -45,7 +45,7 @@ const (
 	defaultMiniVolumeSizeMB       = 128         // Default volume size for mini mode
 	maxVolumeSizeMB               = 1024        // Maximum volume size in MB (1GB)
 	GrpcPortOffset                = 10000       // Offset used to calculate gRPC port from HTTP port
-	defaultMiniPluginJobTypes     = "vacuum,volume_balance,erasure_coding,admin_script"
+	defaultMiniPluginJobTypes     = "all"
 )
 
 var (
@@ -114,7 +114,7 @@ Admin UI (http://localhost:23646) to manage users and policies.
 
 var (
 	miniIp                          = cmdMini.Flag.String("ip", util.DetectedHostAddress(), "ip or server name, also used as identifier")
-	miniBindIp                      = cmdMini.Flag.String("ip.bind", "", "ip address to bind to. If empty, default to same as -ip option.")
+	miniBindIp                      = cmdMini.Flag.String("ip.bind", "0.0.0.0", "ip address to bind to. If empty, default to same as -ip option.")
 	miniTimeout                     = cmdMini.Flag.Int("idleTimeout", 30, "connection idle seconds")
 	miniDataCenter                  = cmdMini.Flag.String("dataCenter", "", "current volume server's data center name")
 	miniRack                        = cmdMini.Flag.String("rack", "", "current volume server's rack name")
@@ -162,7 +162,7 @@ func initMiniMasterFlags() {
 	miniMasterOptions.garbageThreshold = cmdMini.Flag.Float64("master.garbageThreshold", 0.3, "threshold to vacuum and reclaim spaces")
 	miniMasterOptions.metricsAddress = cmdMini.Flag.String("master.metrics.address", "", "Prometheus gateway address")
 	miniMasterOptions.metricsIntervalSec = cmdMini.Flag.Int("master.metrics.intervalSeconds", 15, "Prometheus push interval in seconds")
-	miniMasterOptions.raftResumeState = cmdMini.Flag.Bool("master.resumeState", false, "resume previous state on start master server")
+	miniMasterOptions.raftResumeState = cmdMini.Flag.Bool("master.resumeState", true, "resume previous state on start master server")
 	miniMasterOptions.heartbeatInterval = cmdMini.Flag.Duration("master.heartbeatInterval", 300*time.Millisecond, "heartbeat interval of master servers, and will be randomly multiplied by [1, 1.25)")
 	miniMasterOptions.electionTimeout = cmdMini.Flag.Duration("master.electionTimeout", 10*time.Second, "election timeout of master servers")
 	miniMasterOptions.raftHashicorp = cmdMini.Flag.Bool("master.raftHashicorp", false, "use hashicorp raft")
@@ -250,6 +250,8 @@ func initMiniS3Flags() {
 	miniS3Options.auditLogConfig = cmdMini.Flag.String("s3.auditLogConfig", "", "path to the audit log config file")
 	miniS3Options.allowDeleteBucketNotEmpty = miniS3AllowDeleteBucketNotEmpty
 	miniS3Options.externalUrl = cmdMini.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Used for S3 signature verification behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
+	miniS3Options.defaultFileMode = cmdMini.Flag.String("s3.defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
+	miniS3Options.cacheSizeMB = cmdMini.Flag.Int64("s3.cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
 	// In mini mode, S3 uses the shared debug server started at line 681, not its own separate debug server
 	miniS3Options.debug = new(bool) // explicitly false
 	miniS3Options.debugPort = cmdMini.Flag.Int("s3.debug.port", 6060, "http port for debugging (unused in mini mode)")
@@ -555,9 +557,23 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 // If a gRPC port is 0, it will be set to httpPort + GrpcPortOffset
 // This must be called after HTTP ports are finalized and before services start
 func initializeGrpcPortsOnIP(bindIp string) {
-	// Track gRPC ports allocated during this function to prevent collisions between services
-	// when multiple services need fallback port allocation
-	allocatedGrpcPorts := make(map[int]bool)
+	// Track all ports allocated (both HTTP and gRPC) to prevent collisions.
+	// We must reserve HTTP ports so that gRPC fallback allocation never picks
+	// a port already assigned to an HTTP service (which hasn't bound yet).
+	allocatedPorts := make(map[int]bool)
+
+	// Reserve all HTTP ports first
+	allocatedPorts[*miniMasterOptions.port] = true
+	allocatedPorts[*miniFilerOptions.port] = true
+	allocatedPorts[*miniOptions.v.port] = true
+	allocatedPorts[*miniWebDavOptions.port] = true
+	allocatedPorts[*miniAdminOptions.port] = true
+	if *miniEnableS3 {
+		allocatedPorts[*miniS3Options.port] = true
+		if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
+			allocatedPorts[*miniS3Options.portIceberg] = true
+		}
+	}
 
 	grpcConfigs := []struct {
 		httpPort *int
@@ -593,10 +609,10 @@ func initializeGrpcPortsOnIP(bindIp string) {
 
 		// Verify the gRPC port is available (whether calculated or explicitly set)
 		// Check on both specific IP and all interfaces, and check against already allocated ports
-		if !isPortOpenOnIP(bindIp, *config.grpcPort) || !isPortAvailable(*config.grpcPort) || allocatedGrpcPorts[*config.grpcPort] {
+		if !isPortOpenOnIP(bindIp, *config.grpcPort) || !isPortAvailable(*config.grpcPort) || allocatedPorts[*config.grpcPort] {
 			glog.Warningf("gRPC port %d for %s is not available, finding alternative...", *config.grpcPort, config.name)
 			originalPort := *config.grpcPort
-			newPort := findAvailablePortOnIP(bindIp, originalPort+1, 100, allocatedGrpcPorts)
+			newPort := findAvailablePortOnIP(bindIp, originalPort+1, 100, allocatedPorts)
 			if newPort == 0 {
 				glog.Errorf("Could not find available gRPC port for %s starting from %d, will use %d and fail on binding", config.name, originalPort+1, originalPort)
 			} else {
@@ -604,7 +620,7 @@ func initializeGrpcPortsOnIP(bindIp string) {
 				*config.grpcPort = newPort
 			}
 		}
-		allocatedGrpcPorts[*config.grpcPort] = true
+		allocatedPorts[*config.grpcPort] = true
 		glog.V(1).Infof("%s gRPC port set to %d", config.name, *config.grpcPort)
 	}
 }
@@ -805,9 +821,23 @@ func runMini(cmd *Command, args []string) bool {
 	miniFilerOptions.disableHttp = miniDisableHttp
 	miniMasterOptions.disableHttp = miniDisableHttp
 
+	// Share the S3 static identity config file with the filer so its
+	// credential manager can also serve static users.
+	miniFilerOptions.s3ConfigFile = miniS3Config
+
 	filerAddress := string(pb.NewServerAddress(*miniIp, *miniFilerOptions.port, *miniFilerOptions.portGrpc))
 	miniS3Options.filer = &filerAddress
 	miniWebDavOptions.filer = &filerAddress
+
+	// Register Unix socket paths for gRPC services so local inter-service
+	// communication goes through Unix sockets instead of TCP.
+	pb.RegisterLocalGrpcSocket(*miniMasterOptions.portGrpc, fmt.Sprintf("/tmp/seaweedfs-master-grpc-%d.sock", *miniMasterOptions.portGrpc))
+	pb.RegisterLocalGrpcSocket(*miniOptions.v.portGrpc, fmt.Sprintf("/tmp/seaweedfs-volume-grpc-%d.sock", *miniOptions.v.portGrpc))
+	pb.RegisterLocalGrpcSocket(*miniFilerOptions.portGrpc, fmt.Sprintf("/tmp/seaweedfs-filer-grpc-%d.sock", *miniFilerOptions.portGrpc))
+	if *miniS3Options.portGrpc > 0 {
+		pb.RegisterLocalGrpcSocket(*miniS3Options.portGrpc, fmt.Sprintf("/tmp/seaweedfs-s3-grpc-%d.sock", *miniS3Options.portGrpc))
+	}
+	pb.RegisterLocalGrpcSocket(*miniAdminOptions.grpcPort, fmt.Sprintf("/tmp/seaweedfs-admin-grpc-%d.sock", *miniAdminOptions.grpcPort))
 
 	go stats_collect.StartMetricsServer(*miniMetricsHttpIp, *miniMetricsHttpPort)
 
@@ -1020,7 +1050,7 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 		if miniS3Options.portIceberg != nil {
 			icebergPort = *miniS3Options.portIceberg
 		}
-		if err := startAdminServer(ctx, miniAdminOptions, *miniEnableAdminUI, icebergPort); err != nil {
+		if err := startAdminServer(ctx, miniAdminOptions, *miniEnableAdminUI, icebergPort, ""); err != nil {
 			glog.Errorf("Admin server error: %v", err)
 		}
 	}()

@@ -632,6 +632,10 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 
 		// Set nextMarker only when we have quota to process this entry
 		nextMarker = entry.Name
+		// Track whether this entry is the exact directory targeted by a trailing-slash prefix
+		// (e.g., prefix "foo" from original prefix "foo/"). After recursing into this directory,
+		// we must stop processing siblings to avoid matching unrelated entries like "foo1000".
+		matchedPrefixDir := cursor.prefixEndsOnDelimiter && entry.Name == prefix && entry.IsDirectory
 		if cursor.prefixEndsOnDelimiter {
 			if entry.Name == prefix && entry.IsDirectory {
 				if delimiter != "/" {
@@ -673,15 +677,17 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 			}
 
 			if delimiter != "/" || cursor.prefixEndsOnDelimiter {
-				// When delimiter is empty (recursive mode), recurse into directories but don't add them to results
-				// Only files and versioned objects should appear in results
 				if cursor.prefixEndsOnDelimiter {
 					cursor.prefixEndsOnDelimiter = false
 					if entry.IsDirectoryKeyObject() {
 						eachEntryFn(dir, entry)
 					}
+				} else if entry.IsDirectoryKeyObject() {
+					// Directory key objects (created via PutObject with trailing "/")
+					// must appear as regular keys in recursive listing mode.
+					eachEntryFn(dir, entry)
 				}
-				// Recurse into subdirectory - don't add the directory itself to results
+				// Recurse into subdirectory to list any children
 				subNextMarker, subErr := s3a.doListFilerEntries(client, dir+"/"+entry.Name, "", cursor, "", delimiter, false, bucket, eachEntryFn)
 				if subErr != nil {
 					err = fmt.Errorf("doListFilerEntries2: %w", subErr)
@@ -690,6 +696,9 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 				// println("doListFilerEntries2 dir", dir+"/"+entry.Name, "subNextMarker", subNextMarker)
 				nextMarker = entry.Name + "/" + subNextMarker
 				if cursor.isTruncated {
+					return
+				}
+				if matchedPrefixDir {
 					return
 				}
 				// println("doListFilerEntries2 nextMarker", nextMarker)
@@ -751,60 +760,6 @@ func getListObjectsV1Args(values url.Values) (prefix, marker, delimiter string, 
 	allowUnordered = values.Get("allow-unordered") == "true"
 	errCode = s3err.ErrNone
 	return
-}
-
-func (s3a *S3ApiServer) ensureDirectoryAllEmpty(filerClient filer_pb.SeaweedFilerClient, parentDir, name string) (isEmpty bool, err error) {
-	// println("+ ensureDirectoryAllEmpty", dir, name)
-	glog.V(4).Infof("+ isEmpty %s/%s", parentDir, name)
-	defer glog.V(4).Infof("- isEmpty %s/%s %v", parentDir, name, isEmpty)
-	var fileCounter int
-	var subDirs []string
-	currentDir := parentDir + "/" + name
-	var startFrom string
-	var isExhausted bool
-	var foundEntry bool
-	for fileCounter == 0 && !isExhausted && err == nil {
-		err = filer_pb.SeaweedList(context.Background(), filerClient, currentDir, "", func(entry *filer_pb.Entry, isLast bool) error {
-			foundEntry = true
-			if entry.IsOlderDir() {
-				subDirs = append(subDirs, entry.Name)
-			} else {
-				fileCounter++
-			}
-			startFrom = entry.Name
-			isExhausted = isExhausted || isLast
-			glog.V(4).Infof("    * %s/%s isLast: %t", currentDir, startFrom, isLast)
-			return nil
-		}, startFrom, false, 8)
-		if !foundEntry {
-			break
-		}
-	}
-
-	if err != nil {
-		return false, err
-	}
-
-	if fileCounter > 0 {
-		return false, nil
-	}
-
-	for _, subDir := range subDirs {
-		isSubEmpty, subErr := s3a.ensureDirectoryAllEmpty(filerClient, currentDir, subDir)
-		if subErr != nil {
-			return false, subErr
-		}
-		if !isSubEmpty {
-			return false, nil
-		}
-	}
-
-	glog.V(1).Infof("deleting empty folder %s", currentDir)
-	if err = doDeleteEntry(filerClient, parentDir, name, true, false); err != nil {
-		return
-	}
-
-	return true, nil
 }
 
 // compareWithDelimiter compares two strings for sorting, treating the delimiter character

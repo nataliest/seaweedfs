@@ -408,18 +408,9 @@ func (s3a *S3ApiServer) getBucketConfig(bucket string) (*BucketConfig, s3err.Err
 	// Sync bucket policy to the policy engine for evaluation
 	s3a.syncBucketPolicyToEngine(bucket, config.BucketPolicy)
 
-	// Load CORS configuration from bucket directory content
-	if corsConfig, err := s3a.loadCORSFromBucketContent(bucket); err != nil {
-		if errors.Is(err, filer_pb.ErrNotFound) {
-			// Missing metadata is not an error; fall back cleanly
-			glog.V(2).Infof("CORS metadata not found for bucket %s, falling back to default behavior", bucket)
-		} else {
-			// Log parsing or validation errors
-			glog.Errorf("Failed to load CORS configuration for bucket %s: %v", bucket, err)
-		}
-	} else {
-		config.CORS = corsConfig
-	}
+	// Parse CORS configuration directly from the entry's Content field.
+	// This avoids a redundant RPC call since we already have the entry.
+	config.CORS = parseCORSFromEntryContent(entry.Content)
 
 	// Cache the result
 	s3a.bucketConfigCache.Set(bucket, config)
@@ -434,44 +425,62 @@ func (s3a *S3ApiServer) updateBucketConfig(bucket string, updateFn func(*BucketC
 		return errCode
 	}
 
+	nextConfig := cloneBucketConfig(config)
+	if nextConfig == nil {
+		glog.Errorf("updateBucketConfig: failed to clone config for bucket %s", bucket)
+		return s3err.ErrInternalError
+	}
+
 	// Apply update function
-	if err := updateFn(config); err != nil {
+	if err := updateFn(nextConfig); err != nil {
 		glog.Errorf("updateBucketConfig: update function failed for bucket %s: %v", bucket, err)
 		return s3err.ErrInternalError
 	}
 
 	// Prepare extended attributes
-	if config.Entry.Extended == nil {
-		config.Entry.Extended = make(map[string][]byte)
+	if nextConfig.Entry == nil {
+		glog.Errorf("updateBucketConfig: missing bucket entry for %s", bucket)
+		return s3err.ErrInternalError
+	}
+	if nextConfig.Entry.Extended == nil {
+		nextConfig.Entry.Extended = make(map[string][]byte)
 	}
 
 	// Update extended attributes
-	if config.Versioning != "" {
-		config.Entry.Extended[s3_constants.ExtVersioningKey] = []byte(config.Versioning)
+	if nextConfig.Versioning != "" {
+		nextConfig.Entry.Extended[s3_constants.ExtVersioningKey] = []byte(nextConfig.Versioning)
+	} else {
+		delete(nextConfig.Entry.Extended, s3_constants.ExtVersioningKey)
 	}
-	if config.Ownership != "" {
-		config.Entry.Extended[s3_constants.ExtOwnershipKey] = []byte(config.Ownership)
+	if nextConfig.Ownership != "" {
+		nextConfig.Entry.Extended[s3_constants.ExtOwnershipKey] = []byte(nextConfig.Ownership)
+	} else {
+		delete(nextConfig.Entry.Extended, s3_constants.ExtOwnershipKey)
 	}
-	if config.ACL != nil {
-		config.Entry.Extended[s3_constants.ExtAmzAclKey] = config.ACL
+	if nextConfig.ACL != nil {
+		nextConfig.Entry.Extended[s3_constants.ExtAmzAclKey] = nextConfig.ACL
+	} else {
+		delete(nextConfig.Entry.Extended, s3_constants.ExtAmzAclKey)
 	}
-	if config.Owner != "" {
-		config.Entry.Extended[s3_constants.ExtAmzOwnerKey] = []byte(config.Owner)
+	if nextConfig.Owner != "" {
+		nextConfig.Entry.Extended[s3_constants.ExtAmzOwnerKey] = []byte(nextConfig.Owner)
+	} else {
+		delete(nextConfig.Entry.Extended, s3_constants.ExtAmzOwnerKey)
 	}
 	// Update Object Lock configuration
-	if config.ObjectLockConfig != nil {
-		glog.V(3).Infof("updateBucketConfig: storing Object Lock config for bucket %s: %+v", bucket, config.ObjectLockConfig)
-		if err := StoreObjectLockConfigurationInExtended(config.Entry, config.ObjectLockConfig); err != nil {
+	if nextConfig.ObjectLockConfig != nil {
+		glog.V(3).Infof("updateBucketConfig: storing Object Lock config for bucket %s: %+v", bucket, nextConfig.ObjectLockConfig)
+		if err := StoreObjectLockConfigurationInExtended(nextConfig.Entry, nextConfig.ObjectLockConfig); err != nil {
 			glog.Errorf("updateBucketConfig: failed to store Object Lock configuration for bucket %s: %v", bucket, err)
 			return s3err.ErrInternalError
 		}
 		glog.V(3).Infof("updateBucketConfig: stored Object Lock config in extended attributes for bucket %s, key=%s, value=%s",
-			bucket, s3_constants.ExtObjectLockEnabledKey, string(config.Entry.Extended[s3_constants.ExtObjectLockEnabledKey]))
+			bucket, s3_constants.ExtObjectLockEnabledKey, string(nextConfig.Entry.Extended[s3_constants.ExtObjectLockEnabledKey]))
 	}
 
 	// Save to filer
 	glog.V(3).Infof("updateBucketConfig: saving entry to filer for bucket %s", bucket)
-	err := s3a.updateEntry(s3a.bucketRoot(bucket), config.Entry)
+	err := s3a.updateEntry(s3a.bucketRoot(bucket), nextConfig.Entry)
 	if err != nil {
 		glog.Errorf("updateBucketConfig: failed to update bucket entry for %s: %v", bucket, err)
 		return s3err.ErrInternalError
@@ -479,9 +488,138 @@ func (s3a *S3ApiServer) updateBucketConfig(bucket string, updateFn func(*BucketC
 	glog.V(3).Infof("updateBucketConfig: saved entry to filer for bucket %s", bucket)
 
 	// Update cache
-	s3a.bucketConfigCache.Set(bucket, config)
+	s3a.bucketConfigCache.Set(bucket, nextConfig)
 
 	return s3err.ErrNone
+}
+
+func cloneBucketConfig(config *BucketConfig) *BucketConfig {
+	if config == nil {
+		return nil
+	}
+
+	cloned := *config
+	if config.ACL != nil {
+		cloned.ACL = append([]byte(nil), config.ACL...)
+	}
+	if config.Entry != nil {
+		cloned.Entry = proto.Clone(config.Entry).(*filer_pb.Entry)
+	}
+	if config.CORS != nil {
+		cloned.CORS = cloneCORSConfiguration(config.CORS)
+	}
+	if config.ObjectLockConfig != nil {
+		cloned.ObjectLockConfig = cloneObjectLockConfiguration(config.ObjectLockConfig)
+	}
+	if config.BucketPolicy != nil {
+		cloned.BucketPolicy = cloneBucketPolicy(config.BucketPolicy)
+	}
+
+	return &cloned
+}
+
+func cloneCORSConfiguration(config *cors.CORSConfiguration) *cors.CORSConfiguration {
+	if config == nil {
+		return nil
+	}
+
+	cloned := &cors.CORSConfiguration{
+		CORSRules: make([]cors.CORSRule, len(config.CORSRules)),
+	}
+	for i, rule := range config.CORSRules {
+		cloned.CORSRules[i] = cors.CORSRule{
+			AllowedHeaders: append([]string(nil), rule.AllowedHeaders...),
+			AllowedMethods: append([]string(nil), rule.AllowedMethods...),
+			AllowedOrigins: append([]string(nil), rule.AllowedOrigins...),
+			ExposeHeaders:  append([]string(nil), rule.ExposeHeaders...),
+			ID:             rule.ID,
+		}
+		if rule.MaxAgeSeconds != nil {
+			maxAge := *rule.MaxAgeSeconds
+			cloned.CORSRules[i].MaxAgeSeconds = &maxAge
+		}
+	}
+
+	return cloned
+}
+
+func cloneObjectLockConfiguration(config *ObjectLockConfiguration) *ObjectLockConfiguration {
+	if config == nil {
+		return nil
+	}
+
+	cloned := &ObjectLockConfiguration{
+		XMLNS:             config.XMLNS,
+		XMLName:           config.XMLName,
+		ObjectLockEnabled: config.ObjectLockEnabled,
+	}
+	if config.Rule != nil {
+		cloned.Rule = &ObjectLockRule{
+			XMLName: config.Rule.XMLName,
+		}
+		if config.Rule.DefaultRetention != nil {
+			cloned.Rule.DefaultRetention = &DefaultRetention{
+				XMLName:  config.Rule.DefaultRetention.XMLName,
+				Mode:     config.Rule.DefaultRetention.Mode,
+				Days:     config.Rule.DefaultRetention.Days,
+				Years:    config.Rule.DefaultRetention.Years,
+				DaysSet:  config.Rule.DefaultRetention.DaysSet,
+				YearsSet: config.Rule.DefaultRetention.YearsSet,
+			}
+		}
+	}
+
+	return cloned
+}
+
+func cloneBucketPolicy(policyDoc *policy_engine.PolicyDocument) *policy_engine.PolicyDocument {
+	if policyDoc == nil {
+		return nil
+	}
+
+	cloned := &policy_engine.PolicyDocument{
+		Version:   policyDoc.Version,
+		Statement: make([]policy_engine.PolicyStatement, len(policyDoc.Statement)),
+	}
+	for i, statement := range policyDoc.Statement {
+		cloned.Statement[i] = clonePolicyStatement(statement)
+	}
+
+	return cloned
+}
+
+func clonePolicyStatement(statement policy_engine.PolicyStatement) policy_engine.PolicyStatement {
+	cloned := policy_engine.PolicyStatement{
+		Sid:         statement.Sid,
+		Effect:      statement.Effect,
+		Action:      cloneStringOrStringSlice(statement.Action),
+		NotResource: cloneStringOrStringSlicePtr(statement.NotResource),
+		Principal:   cloneStringOrStringSlicePtr(statement.Principal),
+		Resource:    cloneStringOrStringSlicePtr(statement.Resource),
+	}
+	if statement.Condition != nil {
+		cloned.Condition = make(policy_engine.PolicyConditions, len(statement.Condition))
+		for operator, operands := range statement.Condition {
+			copiedOperands := make(map[string]policy_engine.StringOrStringSlice, len(operands))
+			for key, value := range operands {
+				copiedOperands[key] = cloneStringOrStringSlice(value)
+			}
+			cloned.Condition[operator] = copiedOperands
+		}
+	}
+	return cloned
+}
+
+func cloneStringOrStringSlice(value policy_engine.StringOrStringSlice) policy_engine.StringOrStringSlice {
+	return policy_engine.CloneStringOrStringSlice(value)
+}
+
+func cloneStringOrStringSlicePtr(value *policy_engine.StringOrStringSlice) *policy_engine.StringOrStringSlice {
+	if value == nil {
+		return nil
+	}
+	cloned := policy_engine.CloneStringOrStringSlice(*value)
+	return &cloned
 }
 
 // isVersioningEnabled checks if versioning is enabled for a bucket (with caching)
@@ -588,15 +726,19 @@ func (s3a *S3ApiServer) setBucketOwnership(bucket, ownership string) s3err.Error
 	})
 }
 
-// loadCORSFromBucketContent loads CORS configuration from bucket directory content
-func (s3a *S3ApiServer) loadCORSFromBucketContent(bucket string) (*cors.CORSConfiguration, error) {
-	metadata, err := s3a.GetBucketMetadata(bucket)
-	if err != nil {
-		return nil, err
+// parseCORSFromEntryContent parses CORS configuration directly from an entry's Content field.
+// This avoids a separate RPC call when the entry is already available (e.g., from a
+// subscription event or a prior getBucketEntry call).
+func parseCORSFromEntryContent(content []byte) *cors.CORSConfiguration {
+	if len(content) == 0 {
+		return nil
 	}
-
-	// Note: corsConfig can be nil if no CORS configuration is set, which is valid
-	return metadata.CORS, nil
+	var protoMetadata s3_pb.BucketMetadata
+	if err := proto.Unmarshal(content, &protoMetadata); err != nil {
+		glog.Errorf("parseCORSFromEntryContent: failed to unmarshal protobuf metadata: %v", err)
+		return nil
+	}
+	return corsConfigFromProto(protoMetadata.Cors)
 }
 
 // getCORSConfiguration retrieves CORS configuration with caching

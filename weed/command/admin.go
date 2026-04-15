@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
+
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/spf13/viper"
@@ -28,6 +30,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
 
 var (
@@ -45,6 +48,11 @@ type AdminOptions struct {
 	readOnlyPassword *string
 	dataDir          *string
 	icebergPort      *int
+	urlPrefix        *string
+	debug            *bool
+	debugPort        *int
+	cpuProfile       *string
+	memProfile       *string
 }
 
 func init() {
@@ -60,6 +68,11 @@ func init() {
 	a.readOnlyUser = cmdAdmin.Flag.String("readOnlyUser", "", "read-only user username (optional, for view-only access)")
 	a.readOnlyPassword = cmdAdmin.Flag.String("readOnlyPassword", "", "read-only user password (optional, for view-only access; requires adminPassword to be set)")
 	a.icebergPort = cmdAdmin.Flag.Int("iceberg.port", 8181, "Iceberg REST Catalog port (0 to hide in UI)")
+	a.urlPrefix = cmdAdmin.Flag.String("urlPrefix", "", "URL path prefix when running behind a reverse proxy under a subdirectory (e.g. /seaweedfs)")
+	a.debug = cmdAdmin.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
+	a.debugPort = cmdAdmin.Flag.Int("debug.port", 6060, "http port for debugging")
+	a.cpuProfile = cmdAdmin.Flag.String("cpuprofile", "", "cpu profile output file")
+	a.memProfile = cmdAdmin.Flag.String("memprofile", "", "memory profile output file")
 }
 
 var cmdAdmin = &Command{
@@ -83,6 +96,7 @@ var cmdAdmin = &Command{
     weed admin -port=23646 -master="localhost:9333" -dataDir="/var/lib/seaweedfs-admin"
     weed admin -port=23646 -port.grpc=33646 -master="localhost:9333" -dataDir="~/seaweedfs-admin"
     weed admin -port=9900 -port.grpc=19900 -master="localhost:9333"
+    weed admin -port=23646 -master="localhost:9333" -urlPrefix="/seaweedfs"
 
   Data Directory:
     - If dataDir is specified, admin configuration and maintenance data is persisted
@@ -98,6 +112,9 @@ var cmdAdmin = &Command{
     - IMPORTANT: When read-only credentials are configured, adminPassword MUST also be set
     - This ensures an admin account exists to manage and authorize read-only access
     - Sessions are secured with auto-generated session keys
+    - Credentials can also be set via security.toml [admin] section or environment variables:
+      WEED_ADMIN_USER, WEED_ADMIN_PASSWORD, WEED_ADMIN_READONLY_USER, WEED_ADMIN_READONLY_PASSWORD
+    - Precedence: CLI flag > env var / security.toml > default value
 
   Security Configuration:
     - The admin server reads TLS configuration from security.toml
@@ -125,8 +142,25 @@ var cmdAdmin = &Command{
     - External workers connect with: weed worker -admin=<admin_host:admin_port>
     - Persists plugin metadata under dataDir/plugin when dataDir is configured
 
+  URL Prefix (Subdirectory Deployment):
+    - Use -urlPrefix to run the admin UI behind a reverse proxy under a subdirectory
+    - Example: -urlPrefix="/seaweedfs" makes the UI available at /seaweedfs/admin
+    - The reverse proxy should forward /seaweedfs/* requests to the admin server
+    - All static assets, API endpoints, and navigation links will use the prefix
+    - Session cookies are scoped to the prefix path
+
+  Debugging and Profiling:
+    - Use -debug to start a pprof HTTP server for live profiling (localhost only)
+    - Set -debug.port to choose the pprof port (default 6060)
+    - Profiles are accessible at http://127.0.0.1:<debug.port>/debug/pprof/
+    - Use -cpuprofile and -memprofile to write profiles to files on shutdown
+    - WARNING: -debug exposes runtime internals; use only in trusted environments
+    - Examples:
+      weed admin -debug -debug.port=6060 -master="localhost:9333"
+      weed admin -cpuprofile=cpu.prof -memprofile=mem.prof -master="localhost:9333"
+
   Configuration File:
-    - The security.toml file is read from ".", "$HOME/.seaweedfs/", 
+    - The security.toml file is read from ".", "$HOME/.seaweedfs/",
       "/usr/local/etc/seaweedfs/", or "/etc/seaweedfs/", in that order
     - Generate example security.toml: weed scaffold -config=security
 
@@ -134,8 +168,21 @@ var cmdAdmin = &Command{
 }
 
 func runAdmin(cmd *Command, args []string) bool {
+	if *a.debug {
+		grace.StartDebugServer(*a.debugPort)
+	}
+
+	grace.SetupProfiling(*a.cpuProfile, *a.memProfile)
+
 	// Load security configuration
 	util.LoadSecurityConfiguration()
+
+	// Apply security.toml / env var fallbacks for credential flags.
+	// CLI flags take precedence over security.toml / WEED_* env vars.
+	applyViperFallback(cmd, a.adminUser, "adminUser", "admin.user")
+	applyViperFallback(cmd, a.adminPassword, "adminPassword", "admin.password")
+	applyViperFallback(cmd, a.readOnlyUser, "readOnlyUser", "admin.readonly.user")
+	applyViperFallback(cmd, a.readOnlyPassword, "readOnlyPassword", "admin.readonly.password")
 
 	// Backward compatibility: if -masters is provided, use it
 	if *a.masters != "" {
@@ -221,8 +268,17 @@ func runAdmin(cmd *Command, args []string) bool {
 		cancel()
 	}()
 
+	// Normalize URL prefix
+	urlPrefix := strings.TrimRight(*a.urlPrefix, "/")
+	if urlPrefix != "" && !strings.HasPrefix(urlPrefix, "/") {
+		urlPrefix = "/" + urlPrefix
+	}
+	if urlPrefix != "" {
+		fmt.Printf("URL Prefix: %s\n", urlPrefix)
+	}
+
 	// Start the admin server with all masters (UI enabled by default)
-	err := startAdminServer(ctx, a, true, *a.icebergPort)
+	err := startAdminServer(ctx, a, true, *a.icebergPort, urlPrefix)
 	if err != nil {
 		fmt.Printf("Admin server error: %v\n", err)
 		return false
@@ -233,11 +289,21 @@ func runAdmin(cmd *Command, args []string) bool {
 }
 
 // startAdminServer starts the actual admin server
-func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, icebergPort int) error {
+func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, icebergPort int, urlPrefix string) error {
 	// Create router
 	r := mux.NewRouter()
 	r.Use(loggingMiddleware)
 	r.Use(recoveryMiddleware)
+
+	// Inject URL prefix into request context for use by handlers and templates
+	if urlPrefix != "" {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := dash.WithURLPrefix(r.Context(), urlPrefix)
+				next.ServeHTTP(w, r.WithContext(ctx))
+			})
+		})
+	}
 
 	// Create data directory first if specified (needed for session key storage)
 	var dataDir string
@@ -271,8 +337,12 @@ func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, 
 	store := sessions.NewCookieStore(authKey, encKey)
 
 	// Configure session options to ensure cookies are properly saved
+	cookiePath := "/"
+	if urlPrefix != "" {
+		cookiePath = urlPrefix + "/"
+	}
 	store.Options = &sessions.Options{
-		Path:     "/",
+		Path:     cookiePath,
 		MaxAge:   3600 * 24,    // 24 hours
 		HttpOnly: true,         // Prevent JavaScript access
 		Secure:   cookieSecure, // Set based on actual TLS configuration
@@ -320,9 +390,25 @@ func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, 
 
 	// Server configuration
 	addr := fmt.Sprintf(":%d", *options.port)
+	var handler http.Handler = r
+	if urlPrefix != "" {
+		stripped := http.StripPrefix(urlPrefix, r)
+		handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// Redirect /prefix (no trailing slash) to /prefix/
+			if req.URL.Path == urlPrefix {
+				target := urlPrefix + "/"
+				if req.URL.RawQuery != "" {
+					target += "?" + req.URL.RawQuery
+				}
+				http.Redirect(w, req, target, http.StatusFound)
+				return
+			}
+			stripped.ServeHTTP(w, req)
+		})
+	}
 	server := &http.Server{
 		Addr:    addr,
-		Handler: r,
+		Handler: handler,
 	}
 
 	// Start server
@@ -462,11 +548,6 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// GetAdminOptions returns the admin command options for testing
-func GetAdminOptions() *AdminOptions {
-	return &AdminOptions{}
-}
-
 // loadOrGenerateSessionKeys loads or creates authentication/encryption keys for session cookies.
 func loadOrGenerateSessionKeys(dataDir string) ([]byte, []byte, error) {
 	const keyLen = 32
@@ -532,6 +613,22 @@ func loadOrGenerateSessionKeys(dataDir string) ([]byte, []byte, error) {
 	}
 
 	return key[:keyLen], key[keyLen:], nil
+}
+
+// applyViperFallback sets a flag's value from viper (security.toml / env var)
+// when the flag was not explicitly set on the command line.
+func applyViperFallback(cmd *Command, flagPtr *string, flagName, viperKey string) {
+	explicitlySet := false
+	cmd.Flag.Visit(func(f *flag.Flag) {
+		if f.Name == flagName {
+			explicitlySet = true
+		}
+	})
+	if !explicitlySet {
+		if v := util.GetViper().GetString(viperKey); v != "" {
+			*flagPtr = v
+		}
+	}
 }
 
 // expandHomeDir expands the tilde (~) in a path to the user's home directory

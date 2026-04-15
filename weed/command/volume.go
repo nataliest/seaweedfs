@@ -351,7 +351,7 @@ func parseVolumeTags(tagsArg string, folderCount int) [][]string {
 		tagEntries = strings.Split(tagsArg, ",")
 	}
 	folderTags := make([][]string, folderCount)
-	
+
 	// If exactly one tag entry provided, replicate it to all folders
 	if len(tagEntries) == 1 {
 		normalized := util.NormalizeTagList(strings.Split(tagEntries[0], ":"))
@@ -415,6 +415,7 @@ func (v VolumeServerOptions) startGrpcService(vs volume_server_pb.VolumeServerSe
 			glog.Fatalf("start gRPC service failed, %s", err)
 		}
 	}()
+	pb.ServeGrpcOnLocalSocket(grpcS, grpcPort)
 	return grpcS
 }
 

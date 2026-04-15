@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -32,6 +33,7 @@ const (
 	defaultClusterContextTimeout               = 10 * time.Second
 	defaultWaitingBacklogFloor                 = 8
 	defaultWaitingBacklogMultiplier            = 4
+	maxEstimatedRuntimeCap                     = 8 * time.Hour
 )
 
 type schedulerPolicy struct {
@@ -47,7 +49,9 @@ type schedulerPolicy struct {
 	ExecutorReserveBackoff time.Duration
 }
 
-func (r *Plugin) schedulerLoop() {
+// laneSchedulerLoop is the main scheduling goroutine for a single lane.
+// Each lane runs independently with its own timing, lock scope, and wake channel.
+func (r *Plugin) laneSchedulerLoop(ls *schedulerLaneState) {
 	defer r.wg.Done()
 	for {
 		select {
@@ -56,16 +60,16 @@ func (r *Plugin) schedulerLoop() {
 		default:
 		}
 
-		hadJobs := r.runSchedulerIteration()
-		r.recordSchedulerIterationComplete(hadJobs)
+		hadJobs := r.runLaneSchedulerIteration(ls)
+		r.recordLaneIterationComplete(ls, hadJobs)
 
 		if hadJobs {
 			continue
 		}
 
-		r.setSchedulerLoopState("", "sleeping")
-		idleSleep := r.GetSchedulerConfig().IdleSleepDuration()
-		if nextRun := r.earliestNextDetectionAt(); !nextRun.IsZero() {
+		r.setLaneLoopState(ls, "", "sleeping")
+		idleSleep := LaneIdleSleep(ls.lane)
+		if nextRun := r.earliestLaneDetectionAt(ls.lane); !nextRun.IsZero() {
 			if until := time.Until(nextRun); until <= 0 {
 				idleSleep = 0
 			} else if until < idleSleep {
@@ -81,7 +85,7 @@ func (r *Plugin) schedulerLoop() {
 		case <-r.shutdownCh:
 			timer.Stop()
 			return
-		case <-r.schedulerWakeCh:
+		case <-ls.wakeCh:
 			if !timer.Stop() {
 				<-timer.C
 			}
@@ -91,35 +95,55 @@ func (r *Plugin) schedulerLoop() {
 	}
 }
 
-func (r *Plugin) runSchedulerIteration() bool {
+// runLaneSchedulerIteration runs one scheduling pass for a single lane,
+// processing only the job types assigned to that lane.
+//
+// For lanes that require a lock (e.g. LaneDefault), all job types are
+// processed sequentially under one admin lock because their volume
+// management operations share global state.
+//
+// For lanes that do not require a lock (e.g. LaneIceberg, LaneLifecycle),
+// each job type runs independently in its own goroutine so they do not
+// block each other.
+func (r *Plugin) runLaneSchedulerIteration(ls *schedulerLaneState) bool {
 	r.expireStaleJobs(time.Now().UTC())
 
-	jobTypes := r.registry.DetectableJobTypes()
+	allJobTypes := r.registry.DetectableJobTypes()
+	// Filter to only job types belonging to this lane.
+	var jobTypes []string
+	for _, jt := range allJobTypes {
+		if JobTypeLane(jt) == ls.lane {
+			jobTypes = append(jobTypes, jt)
+		}
+	}
 	if len(jobTypes) == 0 {
-		r.setSchedulerLoopState("", "idle")
+		r.setLaneLoopState(ls, "", "idle")
 		return false
 	}
 
-	r.setSchedulerLoopState("", "waiting_for_lock")
-	releaseLock, err := r.acquireAdminLock("plugin scheduler iteration")
-	if err != nil {
-		glog.Warningf("Plugin scheduler failed to acquire lock: %v", err)
-		r.setSchedulerLoopState("", "idle")
-		return false
+	if LaneRequiresLock(ls.lane) {
+		return r.runLaneSchedulerIterationLocked(ls, jobTypes)
 	}
-	if releaseLock != nil {
-		defer releaseLock()
-	}
+	return r.runLaneSchedulerIterationConcurrent(ls, jobTypes)
+}
 
-	active := make(map[string]struct{}, len(jobTypes))
-	hadJobs := false
+// dueJobType pairs a job type with its resolved scheduling policy.
+type dueJobType struct {
+	jobType string
+	policy  schedulerPolicy
+}
 
+// collectDueJobTypes loads policies for all job types in the lane and
+// returns those whose detection interval has elapsed. It also returns
+// the full set of active job type names for later pruning.
+func (r *Plugin) collectDueJobTypes(ls *schedulerLaneState, jobTypes []string) (active map[string]struct{}, due []dueJobType) {
+	active = make(map[string]struct{}, len(jobTypes))
 	for _, jobType := range jobTypes {
 		active[jobType] = struct{}{}
 
 		policy, enabled, err := r.loadSchedulerPolicy(jobType)
 		if err != nil {
-			glog.Warningf("Plugin scheduler failed to load policy for %s: %v", jobType, err)
+			glog.Warningf("Plugin scheduler [%s] failed to load policy for %s: %v", ls.lane, jobType, err)
 			continue
 		}
 		if !enabled {
@@ -133,33 +157,91 @@ func (r *Plugin) runSchedulerIteration() bool {
 		if !r.markDetectionDue(jobType, policy.DetectionInterval, initialDelay) {
 			continue
 		}
+		due = append(due, dueJobType{jobType: jobType, policy: policy})
+	}
+	return active, due
+}
 
-		detected := r.runJobTypeIteration(jobType, policy)
-		if detected {
+// runLaneSchedulerIterationLocked processes job types sequentially under a
+// single admin lock. Used by the default lane where volume management
+// operations must be serialised.
+func (r *Plugin) runLaneSchedulerIterationLocked(ls *schedulerLaneState, jobTypes []string) bool {
+	r.setLaneLoopState(ls, "", "waiting_for_lock")
+	lockName := fmt.Sprintf("plugin scheduler:%s", ls.lane)
+	releaseLock, err := r.acquireAdminLock(lockName)
+	if err != nil {
+		glog.Warningf("Plugin scheduler [%s] failed to acquire lock: %v", ls.lane, err)
+		r.setLaneLoopState(ls, "", "idle")
+		return false
+	}
+	if releaseLock != nil {
+		defer releaseLock()
+	}
+
+	active, due := r.collectDueJobTypes(ls, jobTypes)
+	hadJobs := false
+	for _, w := range due {
+		if r.runJobTypeIteration(w.jobType, w.policy) {
 			hadJobs = true
 		}
 	}
 
 	r.pruneSchedulerState(active)
 	r.pruneDetectorLeases(active)
-	r.setSchedulerLoopState("", "idle")
+	r.setLaneLoopState(ls, "", "idle")
 	return hadJobs
 }
 
-func (r *Plugin) wakeScheduler() {
+// runLaneSchedulerIterationConcurrent processes each job type in its own
+// goroutine so they run independently. Used by lanes (e.g. iceberg,
+// lifecycle) whose job types do not share global state.
+func (r *Plugin) runLaneSchedulerIterationConcurrent(ls *schedulerLaneState, jobTypes []string) bool {
+	active, due := r.collectDueJobTypes(ls, jobTypes)
+
+	r.setLaneLoopState(ls, "", "busy")
+
+	var hadJobs atomic.Bool
+	var wg sync.WaitGroup
+	for _, w := range due {
+		wg.Add(1)
+		go func(jobType string, policy schedulerPolicy) {
+			defer wg.Done()
+			if r.runJobTypeIteration(jobType, policy) {
+				hadJobs.Store(true)
+			}
+		}(w.jobType, w.policy)
+	}
+	wg.Wait()
+
+	r.pruneSchedulerState(active)
+	r.pruneDetectorLeases(active)
+	r.setLaneLoopState(ls, "", "idle")
+	return hadJobs.Load()
+}
+
+// wakeAllLanes wakes all lane scheduler goroutines.
+func (r *Plugin) wakeAllLanes() {
 	if r == nil {
 		return
 	}
-	select {
-	case r.schedulerWakeCh <- struct{}{}:
-	default:
+	for _, ls := range r.lanes {
+		select {
+		case ls.wakeCh <- struct{}{}:
+		default:
+		}
 	}
+}
+
+// wakeScheduler wakes the lane that owns the given job type, or all lanes
+// if no job type is specified. Kept for backward compatibility.
+func (r *Plugin) wakeScheduler() {
+	r.wakeAllLanes()
 }
 
 func (r *Plugin) runJobTypeIteration(jobType string, policy schedulerPolicy) bool {
 	r.recordSchedulerRunStart(jobType)
 	r.clearWaitingJobQueue(jobType)
-	r.setSchedulerLoopState(jobType, "detecting")
+	r.setSchedulerLoopStateForJobType(jobType, "detecting")
 	r.markJobTypeInFlight(jobType)
 	defer r.finishDetection(jobType)
 
@@ -291,7 +373,27 @@ func (r *Plugin) runJobTypeIteration(jobType string, policy schedulerPolicy) boo
 		return detected
 	}
 
-	r.setSchedulerLoopState(jobType, "executing")
+	r.setSchedulerLoopStateForJobType(jobType, "executing")
+
+	// Scan proposals for the maximum estimated_runtime_seconds so the
+	// execution phase gets enough time for large jobs (e.g. vacuum on
+	// big volumes). If any proposal needs more time than the remaining
+	// JobTypeMaxRuntime, extend the execution context accordingly.
+	var maxEstimatedRuntime time.Duration
+	for _, p := range filtered {
+		if p.Parameters != nil {
+			if est, ok := p.Parameters["estimated_runtime_seconds"]; ok {
+				if v := est.GetInt64Value(); v > 0 {
+					if d := time.Duration(v) * time.Second; d > maxEstimatedRuntime {
+						maxEstimatedRuntime = d
+					}
+				}
+			}
+		}
+	}
+	if maxEstimatedRuntime > maxEstimatedRuntimeCap {
+		maxEstimatedRuntime = maxEstimatedRuntimeCap
+	}
 
 	remaining = time.Until(start.Add(maxRuntime))
 	if remaining <= 0 {
@@ -306,6 +408,17 @@ func (r *Plugin) runJobTypeIteration(jobType string, policy schedulerPolicy) boo
 		return detected
 	}
 
+	// If the longest estimated job exceeds the remaining JobTypeMaxRuntime,
+	// create a new execution context with enough headroom instead of using
+	// jobCtx which would cancel too early.
+	execCtx := jobCtx
+	execCancel := context.CancelFunc(func() {})
+	if maxEstimatedRuntime > 0 && maxEstimatedRuntime > remaining {
+		execCtx, execCancel = context.WithTimeout(context.Background(), maxEstimatedRuntime)
+		remaining = maxEstimatedRuntime
+	}
+	defer execCancel()
+
 	execPolicy := policy
 	if execPolicy.ExecutionTimeout <= 0 {
 		execPolicy.ExecutionTimeout = defaultScheduledExecutionTimeout
@@ -314,10 +427,10 @@ func (r *Plugin) runJobTypeIteration(jobType string, policy schedulerPolicy) boo
 		execPolicy.ExecutionTimeout = remaining
 	}
 
-	successCount, errorCount, canceledCount := r.dispatchScheduledProposals(jobCtx, jobType, filtered, clusterContext, execPolicy)
+	successCount, errorCount, canceledCount := r.dispatchScheduledProposals(execCtx, jobType, filtered, clusterContext, execPolicy)
 
 	status := "success"
-	if jobCtx.Err() != nil {
+	if execCtx.Err() != nil {
 		status = "timeout"
 	} else if errorCount > 0 || canceledCount > 0 {
 		status = "error"
@@ -355,7 +468,7 @@ func (r *Plugin) loadSchedulerPolicy(jobType string) (schedulerPolicy, bool, err
 	policy := schedulerPolicy{
 		DetectionInterval:      durationFromSeconds(adminRuntime.DetectionIntervalSeconds, defaultScheduledDetectionInterval),
 		DetectionTimeout:       durationFromSeconds(adminRuntime.DetectionTimeoutSeconds, defaultScheduledDetectionTimeout),
-		ExecutionTimeout:       defaultScheduledExecutionTimeout,
+		ExecutionTimeout:       durationFromSeconds(adminRuntime.ExecutionTimeoutSeconds, defaultScheduledExecutionTimeout),
 		JobTypeMaxRuntime:      durationFromSeconds(adminRuntime.JobTypeMaxRuntimeSeconds, defaultScheduledJobTypeMaxRuntime),
 		RetryBackoff:           durationFromSeconds(adminRuntime.RetryBackoffSeconds, defaultScheduledRetryBackoff),
 		MaxResults:             adminRuntime.MaxJobsPerDetection,
@@ -390,12 +503,9 @@ func (r *Plugin) loadSchedulerPolicy(jobType string) (schedulerPolicy, bool, err
 		policy.JobTypeMaxRuntime = defaultScheduledJobTypeMaxRuntime
 	}
 
-	// Plugin protocol currently has only detection timeout in admin settings.
-	execTimeout := time.Duration(adminRuntime.DetectionTimeoutSeconds*2) * time.Second
-	if execTimeout < defaultScheduledExecutionTimeout {
-		execTimeout = defaultScheduledExecutionTimeout
+	if policy.ExecutionTimeout < defaultScheduledExecutionTimeout {
+		policy.ExecutionTimeout = defaultScheduledExecutionTimeout
 	}
-	policy.ExecutionTimeout = execTimeout
 
 	return policy, true, nil
 }
@@ -422,6 +532,7 @@ func (r *Plugin) ListSchedulerStates() ([]SchedulerJobTypeState, error) {
 		jobType := jobTypeInfo.JobType
 		state := SchedulerJobTypeState{
 			JobType:           jobType,
+			Lane:              string(JobTypeLane(jobType)),
 			DetectionInFlight: detectionInFlight[jobType],
 		}
 
@@ -496,6 +607,37 @@ func deriveSchedulerAdminRuntime(
 ) *plugin_pb.AdminRuntimeConfig {
 	if cfg != nil && cfg.AdminRuntime != nil {
 		adminConfig := *cfg.AdminRuntime
+		// Overlay descriptor defaults for any zero numeric fields. Persisted
+		// configs from older versions have no execution_timeout_seconds, and
+		// without this overlay the scheduler would fall back to the 90s
+		// default instead of the handler's declared baseline.
+		if descriptor != nil && descriptor.AdminRuntimeDefaults != nil {
+			defaults := descriptor.AdminRuntimeDefaults
+			if adminConfig.DetectionIntervalSeconds <= 0 {
+				adminConfig.DetectionIntervalSeconds = defaults.DetectionIntervalSeconds
+			}
+			if adminConfig.DetectionTimeoutSeconds <= 0 {
+				adminConfig.DetectionTimeoutSeconds = defaults.DetectionTimeoutSeconds
+			}
+			if adminConfig.MaxJobsPerDetection <= 0 {
+				adminConfig.MaxJobsPerDetection = defaults.MaxJobsPerDetection
+			}
+			if adminConfig.GlobalExecutionConcurrency <= 0 {
+				adminConfig.GlobalExecutionConcurrency = defaults.GlobalExecutionConcurrency
+			}
+			if adminConfig.PerWorkerExecutionConcurrency <= 0 {
+				adminConfig.PerWorkerExecutionConcurrency = defaults.PerWorkerExecutionConcurrency
+			}
+			if adminConfig.RetryBackoffSeconds <= 0 {
+				adminConfig.RetryBackoffSeconds = defaults.RetryBackoffSeconds
+			}
+			if adminConfig.JobTypeMaxRuntimeSeconds <= 0 {
+				adminConfig.JobTypeMaxRuntimeSeconds = defaults.JobTypeMaxRuntimeSeconds
+			}
+			if adminConfig.ExecutionTimeoutSeconds <= 0 {
+				adminConfig.ExecutionTimeoutSeconds = defaults.ExecutionTimeoutSeconds
+			}
+		}
 		return &adminConfig
 	}
 
@@ -514,6 +656,7 @@ func deriveSchedulerAdminRuntime(
 		RetryLimit:                    defaults.RetryLimit,
 		RetryBackoffSeconds:           defaults.RetryBackoffSeconds,
 		JobTypeMaxRuntimeSeconds:      defaults.JobTypeMaxRuntimeSeconds,
+		ExecutionTimeoutSeconds:       defaults.ExecutionTimeoutSeconds,
 	}
 }
 
@@ -541,6 +684,35 @@ func (r *Plugin) markDetectionDue(jobType string, interval, initialDelay time.Du
 	return true
 }
 
+// earliestLaneDetectionAt returns the earliest next detection time among
+// job types that belong to the given lane.
+func (r *Plugin) earliestLaneDetectionAt(lane SchedulerLane) time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+
+	r.schedulerMu.Lock()
+	defer r.schedulerMu.Unlock()
+
+	var earliest time.Time
+	for jobType, nextRun := range r.nextDetectionAt {
+		if JobTypeLane(jobType) != lane {
+			continue
+		}
+		if nextRun.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || nextRun.Before(earliest) {
+			earliest = nextRun
+		}
+	}
+
+	return earliest
+}
+
+// earliestNextDetectionAt returns the earliest next detection time across
+// all job types regardless of lane. Kept for backward compatibility and
+// the global scheduler status API.
 func (r *Plugin) earliestNextDetectionAt() time.Time {
 	if r == nil {
 		return time.Time{}
@@ -837,6 +1009,17 @@ func (r *Plugin) tryReserveExecutorCapacity(
 	jobType string,
 	policy schedulerPolicy,
 ) (func(), bool) {
+	return r.tryReserveExecutorCapacityForLane(executor, jobType, policy, JobTypeLane(jobType))
+}
+
+// tryReserveExecutorCapacityForLane reserves an execution slot on the
+// per-lane reservation pool so that lanes cannot starve each other.
+func (r *Plugin) tryReserveExecutorCapacityForLane(
+	executor *WorkerSession,
+	jobType string,
+	policy schedulerPolicy,
+	lane SchedulerLane,
+) (func(), bool) {
 	if executor == nil || strings.TrimSpace(executor.WorkerID) == "" {
 		return nil, false
 	}
@@ -852,19 +1035,58 @@ func (r *Plugin) tryReserveExecutorCapacity(
 
 	workerID := strings.TrimSpace(executor.WorkerID)
 
-	r.schedulerExecMu.Lock()
-	reserved := r.schedulerExecReservations[workerID]
-	if heartbeatUsed+reserved >= limit {
+	ls := r.lanes[lane]
+	if ls == nil {
+		// Fallback to global reservations if lane state is missing.
+		r.schedulerExecMu.Lock()
+		reserved := r.schedulerExecReservations[workerID]
+		if heartbeatUsed+reserved >= limit {
+			r.schedulerExecMu.Unlock()
+			return nil, false
+		}
+		r.schedulerExecReservations[workerID] = reserved + 1
 		r.schedulerExecMu.Unlock()
+		release := func() { r.releaseExecutorCapacity(workerID) }
+		return release, true
+	}
+
+	ls.execMu.Lock()
+	reserved := ls.execRes[workerID]
+	if heartbeatUsed+reserved >= limit {
+		ls.execMu.Unlock()
 		return nil, false
 	}
-	r.schedulerExecReservations[workerID] = reserved + 1
-	r.schedulerExecMu.Unlock()
+	ls.execRes[workerID] = reserved + 1
+	ls.execMu.Unlock()
 
 	release := func() {
-		r.releaseExecutorCapacity(workerID)
+		r.releaseExecutorCapacityForLane(workerID, lane)
 	}
 	return release, true
+}
+
+// releaseExecutorCapacityForLane releases a reservation from the per-lane pool.
+func (r *Plugin) releaseExecutorCapacityForLane(workerID string, lane SchedulerLane) {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return
+	}
+
+	ls := r.lanes[lane]
+	if ls == nil {
+		r.releaseExecutorCapacity(workerID)
+		return
+	}
+
+	ls.execMu.Lock()
+	defer ls.execMu.Unlock()
+
+	current := ls.execRes[workerID]
+	if current <= 1 {
+		delete(ls.execRes, workerID)
+		return
+	}
+	ls.execRes[workerID] = current - 1
 }
 
 func (r *Plugin) releaseExecutorCapacity(workerID string) {
@@ -937,7 +1159,24 @@ func (r *Plugin) executeScheduledJobWithExecutor(
 		if parent == nil {
 			parent = context.Background()
 		}
-		execCtx, cancel := context.WithTimeout(parent, policy.ExecutionTimeout)
+		// Use the job's estimated runtime if provided and larger than the
+		// default execution timeout. This lets handlers like vacuum scale
+		// the timeout based on volume size so large volumes are not killed.
+		timeout := policy.ExecutionTimeout
+		if job.Parameters != nil {
+			if est, ok := job.Parameters["estimated_runtime_seconds"]; ok {
+				if v := est.GetInt64Value(); v > 0 {
+					estimated := time.Duration(v) * time.Second
+					if estimated > maxEstimatedRuntimeCap {
+						estimated = maxEstimatedRuntimeCap
+					}
+					if estimated > timeout {
+						timeout = estimated
+					}
+				}
+			}
+		}
+		execCtx, cancel := context.WithTimeout(parent, timeout)
 		_, err := r.executeJobWithExecutor(execCtx, executor, job, clusterContext, int32(attempt))
 		cancel()
 		if err == nil {
@@ -1134,22 +1373,6 @@ func secondsFromDuration(duration time.Duration) int32 {
 	return int32(duration / time.Second)
 }
 
-func waitForShutdownOrTimer(shutdown <-chan struct{}, duration time.Duration) bool {
-	if duration <= 0 {
-		return true
-	}
-
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-
-	select {
-	case <-shutdown:
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
 func waitForShutdownOrTimerWithContext(shutdown <-chan struct{}, ctx context.Context, duration time.Duration) bool {
 	if duration <= 0 {
 		return true
@@ -1252,6 +1475,35 @@ func isActiveTrackedJobState(state string) bool {
 func isWaitingTrackedJobState(state string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(state))
 	return normalized == "pending" || normalized == "job_state_pending"
+}
+
+// DispatchProposals dispatches a batch of proposals using the same capacity-aware
+// dispatch logic as the scheduler loop: concurrent execution, executor reservation
+// with backoff, and per-job retry on transient errors. The scheduler policy is
+// loaded from the persisted job type config; if the job type has no config or is
+// disabled a sensible default policy is used so manual runs always work.
+func (r *Plugin) DispatchProposals(
+	ctx context.Context,
+	jobType string,
+	proposals []*plugin_pb.JobProposal,
+	clusterContext *plugin_pb.ClusterContext,
+) (successCount, errorCount, canceledCount int) {
+	if len(proposals) == 0 {
+		return 0, 0, 0
+	}
+
+	policy, enabled, err := r.loadSchedulerPolicy(jobType)
+	if err != nil || !enabled {
+		policy = schedulerPolicy{
+			ExecutionConcurrency:   defaultScheduledExecutionConcurrency,
+			PerWorkerConcurrency:   defaultScheduledPerWorkerConcurrency,
+			ExecutionTimeout:       defaultScheduledExecutionTimeout,
+			RetryBackoff:           defaultScheduledRetryBackoff,
+			ExecutorReserveBackoff: 200 * time.Millisecond,
+		}
+	}
+
+	return r.dispatchScheduledProposals(ctx, jobType, proposals, clusterContext, policy)
 }
 
 func (r *Plugin) filterScheduledProposals(proposals []*plugin_pb.JobProposal) []*plugin_pb.JobProposal {

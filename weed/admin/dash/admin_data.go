@@ -45,13 +45,15 @@ type ObjectStoreUser struct {
 	SecretKey   string   `json:"secret_key"`
 	Permissions []string `json:"permissions"`
 	PolicyNames []string `json:"policy_names"`
+	IsStatic    bool     `json:"is_static"` // loaded from static config file, not editable
 }
 
 type ObjectStoreUsersData struct {
-	Username    string            `json:"username"`
-	Users       []ObjectStoreUser `json:"users"`
-	TotalUsers  int               `json:"total_users"`
-	LastUpdated time.Time         `json:"last_updated"`
+	Username         string            `json:"username"`
+	Users            []ObjectStoreUser `json:"users"`
+	TotalUsers       int               `json:"total_users"`
+	HasAnonymousUser bool              `json:"has_anonymous_user"`
+	LastUpdated      time.Time         `json:"last_updated"`
 }
 
 // User management request structures

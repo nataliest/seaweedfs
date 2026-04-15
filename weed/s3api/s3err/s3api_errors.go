@@ -68,6 +68,7 @@ const (
 	ErrInvalidMaxDeleteObjects
 	ErrInvalidPartNumberMarker
 	ErrInvalidPart
+	ErrInvalidPartOrder
 	ErrInvalidRange
 	ErrInternalError
 	ErrInvalidCopyDest
@@ -145,6 +146,9 @@ const (
 	ErrInvalidStorageClass
 
 	ErrInvalidAttributeName
+
+	// Object key length errors
+	ErrKeyTooLongError
 )
 
 // Error message constants for checksum validation
@@ -286,6 +290,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrInvalidPart: {
 		Code:           "InvalidPart",
 		Description:    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidPartOrder: {
+		Code:           "InvalidPartOrder",
+		Description:    "The list of parts was not in ascending order. The parts list must be specified in order by part number.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
@@ -606,6 +615,12 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrInvalidAttributeName: {
 		Code:           "InvalidArgument",
 		Description:    "Invalid attribute name specified",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrKeyTooLongError: {
+		Code:           "KeyTooLongError",
+		Description:    "Your key is too long.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 }

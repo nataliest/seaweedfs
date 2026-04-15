@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,13 @@ var (
 	once        sync.Once
 )
 
+var uploadRetryableAssignErrList = []string{
+	"transport",
+	"is read only",
+	"failed to write to local disk",
+	"Volume Size ",
+}
+
 // HTTPClient interface for testing
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -127,6 +135,66 @@ func newUploader(httpClient HTTPClient) *Uploader {
 	}
 }
 
+// NewUploaderWithHttpClient creates an Uploader that uses the provided HTTP
+// client instead of the global one. This is used by filer.sync to upload to
+// remote clusters that use different TLS certificates.
+func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
+	return &Uploader{
+		httpClient: httpClient,
+	}
+}
+
+func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+	doUploadFunc := func() error {
+		var host string
+		var auth security.EncodedJwt
+		fileId, host, auth, err = assignFn()
+		if err != nil {
+			return err
+		}
+
+		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
+		uploadOption.Jwt = auth
+
+		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
+		return err
+	}
+
+	if uploadOption.RetryForever {
+		util.RetryUntil("uploadWithRetryForever", doUploadFunc, func(err error) (shouldContinue bool) {
+			glog.V(0).Infof("upload content: %v", err)
+			return true
+		})
+	} else {
+		err = util.MultiRetry("uploadWithRetry", uploadRetryableAssignErrList, doUploadFunc)
+	}
+
+	return
+}
+
+// AssignFunc returns a file ID, host, and auth token for uploading.
+type AssignFunc func() (fileId string, host string, auth security.EncodedJwt, err error)
+
+// UploadWithAssignFunc uploads data using a caller-provided assign function.
+// This allows callers to use pre-allocated file IDs from a pool instead of
+// making an AssignVolume RPC per chunk.
+func (uploader *Uploader) UploadWithAssignFunc(assignFn AssignFunc, uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
+	bytesReader, ok := reader.(*util.BytesReader)
+	if ok {
+		data = bytesReader.Bytes
+	} else {
+		data, err = io.ReadAll(reader)
+		if err != nil {
+			glog.V(0).Infof("upload read input %s: %v", uploadOption.SourceUrl, err)
+			err = fmt.Errorf("read input: %w", err)
+			return
+		}
+		glog.V(4).Infof("upload read %d bytes from %s", len(data), uploadOption.SourceUrl)
+	}
+	fileId, uploadResult, err = uploader.uploadWithRetryData(assignFn, uploadOption, genFileUrlFn, data)
+	return
+}
+
 // UploadWithRetry will retry both assigning volume request and uploading content
 // The option parameter does not need to specify UploadUrl and Jwt, which will come from assigning volume.
 func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
@@ -143,11 +211,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 		glog.V(4).Infof("upload read %d bytes from %s", len(data), uploadOption.SourceUrl)
 	}
 
-	doUploadFunc := func() error {
-
-		var host string
-		var auth security.EncodedJwt
-
+	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, err error) {
 		// grpc assign volume
 		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 			resp, assignErr := client.AssignVolume(context.Background(), assignRequest)
@@ -165,26 +229,10 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 
 			return nil
 		}); grpcAssignErr != nil {
-			return fmt.Errorf("filerGrpcAddress assign volume: %w", grpcAssignErr)
+			err = fmt.Errorf("filerGrpcAddress assign volume: %w", grpcAssignErr)
 		}
-
-		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
-		uploadOption.Jwt = auth
-
-		var uploadErr error
-		uploadResult, uploadErr = uploader.retriedUploadData(context.Background(), data, uploadOption)
-		return uploadErr
-	}
-	if uploadOption.RetryForever {
-		util.RetryUntil("uploadWithRetryForever", doUploadFunc, func(err error) (shouldContinue bool) {
-			glog.V(0).Infof("upload content: %v", err)
-			return true
-		})
-	} else {
-		uploadErrList := []string{"transport", "is read only"}
-		err = util.MultiRetry("uploadWithRetry", uploadErrList, doUploadFunc)
-	}
-
+		return
+	}, uploadOption, genFileUrlFn, data)
 	return
 }
 
@@ -415,6 +463,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 		}
 	}
 	if post_err != nil {
+		stats.UploadErrorCounter.WithLabelValues("0").Inc()
 		return nil, fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)
 	}
 	// print("-")
@@ -428,15 +477,18 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 
 	resp_body, ra_err := io.ReadAll(resp.Body)
 	if ra_err != nil {
+		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		return nil, fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)
 	}
 
 	unmarshal_err := json.Unmarshal(resp_body, &ret)
 	if unmarshal_err != nil {
+		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		glog.ErrorfCtx(ctx, "unmarshal %s: %v", option.UploadUrl, string(resp_body))
 		return nil, fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)
 	}
 	if ret.Error != "" {
+		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		return nil, fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)
 	}
 	ret.ETag = etag

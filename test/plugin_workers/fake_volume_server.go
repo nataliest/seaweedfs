@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // VolumeServer provides a minimal volume server for erasure coding tests.
@@ -27,19 +29,21 @@ type VolumeServer struct {
 	address  string
 	baseDir  string
 
-	mu                 sync.Mutex
-	receivedFiles      map[string]uint64
-	mountRequests      []*volume_server_pb.VolumeEcShardsMountRequest
-	deleteRequests     []*volume_server_pb.VolumeDeleteRequest
-	markReadonlyCalls  int
-	vacuumGarbageRatio float64
-	vacuumCheckCalls   int
-	vacuumCompactCalls int
-	vacuumCommitCalls  int
-	vacuumCleanupCalls int
-	volumeCopyCalls    int
-	volumeMountCalls   int
-	tailReceiverCalls  int
+	mu                  sync.Mutex
+	receivedFiles       map[string]uint64
+	mountRequests       []*volume_server_pb.VolumeEcShardsMountRequest
+	deleteRequests      []*volume_server_pb.VolumeDeleteRequest
+	markReadonlyCalls   int
+	markWritableCalls   int
+	readFileStatusCalls int
+	vacuumGarbageRatio  float64
+	vacuumCheckCalls    int
+	vacuumCompactCalls  int
+	vacuumCommitCalls   int
+	vacuumCleanupCalls  int
+	volumeCopyCalls     int
+	volumeMountCalls    int
+	tailReceiverCalls   int
 }
 
 // NewVolumeServer starts a test volume server using the provided base directory.
@@ -151,6 +155,20 @@ func (v *VolumeServer) MarkReadonlyCount() int {
 	return v.markReadonlyCalls
 }
 
+// MarkWritableCount returns the number of writable calls.
+func (v *VolumeServer) MarkWritableCount() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.markWritableCalls
+}
+
+// ReadFileStatusCount returns the number of ReadVolumeFileStatus calls.
+func (v *VolumeServer) ReadFileStatusCount() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.readFileStatusCalls
+}
+
 // Shutdown stops the volume server.
 func (v *VolumeServer) Shutdown() {
 	if v.server != nil {
@@ -180,11 +198,24 @@ func (v *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream vo
 	defer file.Close()
 
 	buf := make([]byte, 64*1024)
+	remaining := int64(req.GetStopOffset())
 	for {
-		n, readErr := file.Read(buf)
+		if remaining == 0 {
+			break
+		}
+
+		readBuf := buf
+		if remaining > 0 && remaining < int64(len(buf)) {
+			readBuf = buf[:remaining]
+		}
+
+		n, readErr := file.Read(readBuf)
 		if n > 0 {
-			if err := stream.Send(&volume_server_pb.CopyFileResponse{FileContent: buf[:n]}); err != nil {
+			if err := stream.Send(&volume_server_pb.CopyFileResponse{FileContent: readBuf[:n]}); err != nil {
 				return err
+			}
+			if remaining > 0 {
+				remaining -= int64(n)
 			}
 		}
 		if readErr == io.EOF {
@@ -280,6 +311,36 @@ func (v *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serve
 	return &volume_server_pb.VolumeMarkReadonlyResponse{}, nil
 }
 
+func (v *VolumeServer) VolumeMarkWritable(ctx context.Context, req *volume_server_pb.VolumeMarkWritableRequest) (*volume_server_pb.VolumeMarkWritableResponse, error) {
+	v.mu.Lock()
+	v.markWritableCalls++
+	v.mu.Unlock()
+	return &volume_server_pb.VolumeMarkWritableResponse{}, nil
+}
+
+func (v *VolumeServer) ReadVolumeFileStatus(ctx context.Context, req *volume_server_pb.ReadVolumeFileStatusRequest) (*volume_server_pb.ReadVolumeFileStatusResponse, error) {
+	v.mu.Lock()
+	v.readFileStatusCalls++
+	v.mu.Unlock()
+
+	datInfo, err := os.Stat(v.filePath(req.VolumeId, ".dat"))
+	if err != nil {
+		return nil, err
+	}
+
+	idxInfo, err := os.Stat(v.filePath(req.VolumeId, ".idx"))
+	if err != nil {
+		return nil, err
+	}
+
+	return &volume_server_pb.ReadVolumeFileStatusResponse{
+		VolumeId:    req.VolumeId,
+		DatFileSize: uint64(datInfo.Size()),
+		IdxFileSize: uint64(idxInfo.Size()),
+		FileCount:   1,
+	}, nil
+}
+
 func (v *VolumeServer) VacuumVolumeCheck(ctx context.Context, req *volume_server_pb.VacuumVolumeCheckRequest) (*volume_server_pb.VacuumVolumeCheckResponse, error) {
 	v.mu.Lock()
 	v.vacuumCheckCalls++
@@ -314,7 +375,27 @@ func (v *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, strea
 	v.volumeCopyCalls++
 	v.mu.Unlock()
 
-	if err := stream.Send(&volume_server_pb.VolumeCopyResponse{ProcessedBytes: 1024}); err != nil {
+	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
+	var statusResp *volume_server_pb.ReadVolumeFileStatusResponse
+	if err := operation.WithVolumeServerClient(false, pb.ServerAddress(req.SourceDataNode), dialOption,
+		func(client volume_server_pb.VolumeServerClient) error {
+			var readErr error
+			statusResp, readErr = client.ReadVolumeFileStatus(stream.Context(), &volume_server_pb.ReadVolumeFileStatusRequest{
+				VolumeId: req.VolumeId,
+			})
+			return readErr
+		}); err != nil {
+		return err
+	}
+
+	if err := v.copyRemoteFile(stream.Context(), req.SourceDataNode, req.VolumeId, ".dat", statusResp.DatFileSize, dialOption); err != nil {
+		return err
+	}
+	if err := v.copyRemoteFile(stream.Context(), req.SourceDataNode, req.VolumeId, ".idx", statusResp.IdxFileSize, dialOption); err != nil {
+		return err
+	}
+
+	if err := stream.Send(&volume_server_pb.VolumeCopyResponse{ProcessedBytes: int64(statusResp.DatFileSize + statusResp.IdxFileSize)}); err != nil {
 		return err
 	}
 	return stream.Send(&volume_server_pb.VolumeCopyResponse{LastAppendAtNs: uint64(time.Now().UnixNano())})
@@ -332,4 +413,45 @@ func (v *VolumeServer) VolumeTailReceiver(ctx context.Context, req *volume_serve
 	v.tailReceiverCalls++
 	v.mu.Unlock()
 	return &volume_server_pb.VolumeTailReceiverResponse{}, nil
+}
+
+func (v *VolumeServer) copyRemoteFile(ctx context.Context, sourceDataNode string, volumeID uint32, ext string, fileSize uint64, dialOption grpc.DialOption) error {
+	path := v.filePath(volumeID, ext)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	return operation.WithVolumeServerClient(true, pb.ServerAddress(sourceDataNode), dialOption,
+		func(client volume_server_pb.VolumeServerClient) error {
+			stream, err := client.CopyFile(ctx, &volume_server_pb.CopyFileRequest{
+				VolumeId:   volumeID,
+				Ext:        ext,
+				StopOffset: fileSize,
+			})
+			if err != nil {
+				return err
+			}
+
+			for {
+				resp, recvErr := stream.Recv()
+				if recvErr == io.EOF {
+					return nil
+				}
+				if recvErr != nil {
+					return recvErr
+				}
+				if len(resp.FileContent) == 0 {
+					continue
+				}
+				if _, err := file.Write(resp.FileContent); err != nil {
+					return err
+				}
+			}
+		})
 }

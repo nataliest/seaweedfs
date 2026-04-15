@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -67,7 +68,7 @@ func (h *AdminHandlers) SetupRoutes(r *mux.Router, authRequired bool, adminUser,
 
 	// Favicon route (no auth required) - redirect to static version
 	r.HandleFunc("/favicon.ico", func(w http.ResponseWriter, req *http.Request) {
-		http.Redirect(w, req, "/static/favicon.ico", http.StatusMovedPermanently)
+		http.Redirect(w, req, dash.P(req.Context(), "/static/favicon.ico"), http.StatusMovedPermanently)
 	}).Methods(http.MethodGet)
 
 	// Skip UI routes if UI is not enabled
@@ -146,6 +147,13 @@ func (h *AdminHandlers) registerUIRoutes(r *mux.Router) {
 	r.HandleFunc("/plugin/detection", h.pluginHandlers.ShowPluginDetection).Methods(http.MethodGet)
 	r.HandleFunc("/plugin/execution", h.pluginHandlers.ShowPluginExecution).Methods(http.MethodGet)
 	r.HandleFunc("/plugin/monitoring", h.pluginHandlers.ShowPluginMonitoring).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}", h.pluginHandlers.ShowPluginLane).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}/configuration", h.pluginHandlers.ShowPluginLaneConfiguration).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}/queue", h.pluginHandlers.ShowPluginLaneQueue).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}/detection", h.pluginHandlers.ShowPluginLaneDetection).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}/execution", h.pluginHandlers.ShowPluginLaneExecution).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}/monitoring", h.pluginHandlers.ShowPluginLaneMonitoring).Methods(http.MethodGet)
+	r.HandleFunc("/plugin/lanes/{lane}/workers", h.pluginHandlers.ShowPluginLaneWorkers).Methods(http.MethodGet)
 }
 
 func (h *AdminHandlers) registerAPIRoutes(api *mux.Router, enforceWrite bool) {
@@ -244,10 +252,9 @@ func (h *AdminHandlers) registerAPIRoutes(api *mux.Router, enforceWrite bool) {
 
 	pluginApi := api.PathPrefix("/plugin").Subrouter()
 	pluginApi.HandleFunc("/status", h.adminServer.GetPluginStatusAPI).Methods(http.MethodGet)
+	pluginApi.HandleFunc("/lanes", h.adminServer.GetPluginLanesAPI).Methods(http.MethodGet)
 	pluginApi.HandleFunc("/workers", h.adminServer.GetPluginWorkersAPI).Methods(http.MethodGet)
 	pluginApi.HandleFunc("/job-types", h.adminServer.GetPluginJobTypesAPI).Methods(http.MethodGet)
-	pluginApi.HandleFunc("/scheduler-config", h.adminServer.GetPluginSchedulerConfigAPI).Methods(http.MethodGet)
-	pluginApi.Handle("/scheduler-config", wrapWrite(h.adminServer.UpdatePluginSchedulerConfigAPI)).Methods(http.MethodPut)
 	pluginApi.HandleFunc("/jobs", h.adminServer.GetPluginJobsAPI).Methods(http.MethodGet)
 	pluginApi.HandleFunc("/jobs/{jobId}", h.adminServer.GetPluginJobAPI).Methods(http.MethodGet)
 	pluginApi.HandleFunc("/jobs/{jobId}/detail", h.adminServer.GetPluginJobDetailAPI).Methods(http.MethodGet)
@@ -295,8 +302,26 @@ func (h *AdminHandlers) ShowDashboard(w http.ResponseWriter, r *http.Request) {
 
 // ShowS3Buckets renders the Object Store buckets management page
 func (h *AdminHandlers) ShowS3Buckets(w http.ResponseWriter, r *http.Request) {
-	// Get Object Store buckets data from the server
-	s3Data := h.getS3BucketsData(r)
+	// Get pagination and sorting parameters from query string
+	page := 1
+	if p := r.URL.Query().Get("page"); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+
+	pageSize := 100
+	if ps := r.URL.Query().Get("pageSize"); ps != "" {
+		if parsed, err := strconv.Atoi(ps); err == nil && parsed > 0 && parsed <= 1000 {
+			pageSize = parsed
+		}
+	}
+
+	sortBy := defaultQuery(r.URL.Query().Get("sortBy"), "name")
+	sortOrder := defaultQuery(r.URL.Query().Get("sortOrder"), "asc")
+
+	// Get Object Store buckets data with pagination
+	s3Data := h.getS3BucketsData(r, page, pageSize, sortBy, sortOrder)
 	username := h.getUsername(r)
 
 	// Render HTML template
@@ -428,20 +453,20 @@ func (h *AdminHandlers) getUsername(r *http.Request) string {
 
 // ShowIcebergCatalog redirects legacy Iceberg catalog URL to the merged S3 Tables buckets page.
 func (h *AdminHandlers) ShowIcebergCatalog(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/object-store/s3tables/buckets", http.StatusMovedPermanently)
+	http.Redirect(w, r, dash.P(r.Context(), "/object-store/s3tables/buckets"), http.StatusMovedPermanently)
 }
 
 // ShowIcebergNamespaces redirects legacy Iceberg namespaces URL to the merged S3 Tables namespaces page.
 func (h *AdminHandlers) ShowIcebergNamespaces(w http.ResponseWriter, r *http.Request) {
 	catalogName := mux.Vars(r)["catalog"]
-	http.Redirect(w, r, "/object-store/s3tables/buckets/"+url.PathEscape(catalogName)+"/namespaces", http.StatusMovedPermanently)
+	http.Redirect(w, r, dash.P(r.Context(), "/object-store/s3tables/buckets/"+url.PathEscape(catalogName)+"/namespaces"), http.StatusMovedPermanently)
 }
 
 // ShowIcebergTables redirects legacy Iceberg tables URL to the merged S3 Tables tables page.
 func (h *AdminHandlers) ShowIcebergTables(w http.ResponseWriter, r *http.Request) {
 	catalogName := mux.Vars(r)["catalog"]
 	namespace := mux.Vars(r)["namespace"]
-	http.Redirect(w, r, "/object-store/s3tables/buckets/"+url.PathEscape(catalogName)+"/namespaces/"+url.PathEscape(namespace)+"/tables", http.StatusMovedPermanently)
+	http.Redirect(w, r, dash.P(r.Context(), "/object-store/s3tables/buckets/"+url.PathEscape(catalogName)+"/namespaces/"+url.PathEscape(namespace)+"/tables"), http.StatusMovedPermanently)
 }
 
 // ShowIcebergTableDetails redirects legacy Iceberg table details URL to the merged S3 Tables details page.
@@ -449,7 +474,7 @@ func (h *AdminHandlers) ShowIcebergTableDetails(w http.ResponseWriter, r *http.R
 	catalogName := mux.Vars(r)["catalog"]
 	namespace := mux.Vars(r)["namespace"]
 	tableName := mux.Vars(r)["table"]
-	http.Redirect(w, r, "/object-store/s3tables/buckets/"+url.PathEscape(catalogName)+"/namespaces/"+url.PathEscape(namespace)+"/tables/"+url.PathEscape(tableName), http.StatusMovedPermanently)
+	http.Redirect(w, r, dash.P(r.Context(), "/object-store/s3tables/buckets/"+url.PathEscape(catalogName)+"/namespaces/"+url.PathEscape(namespace)+"/tables/"+url.PathEscape(tableName)), http.StatusMovedPermanently)
 }
 
 // ShowBucketDetails returns detailed information about a specific bucket
@@ -463,15 +488,15 @@ func (h *AdminHandlers) ShowBucketDetails(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, details)
 }
 
-// getS3BucketsData retrieves Object Store buckets data from the server
-func (h *AdminHandlers) getS3BucketsData(r *http.Request) dash.S3BucketsData {
+// getS3BucketsData retrieves Object Store buckets data from the server with pagination
+func (h *AdminHandlers) getS3BucketsData(r *http.Request, page, pageSize int, sortBy, sortOrder string) dash.S3BucketsData {
 	username := dash.UsernameFromContext(r.Context())
 	if username == "" {
 		username = "admin"
 	}
 
 	// Get Object Store buckets data
-	data, err := h.adminServer.GetS3BucketsData()
+	data, err := h.adminServer.GetS3BucketsData(page, pageSize, sortBy, sortOrder)
 	if err != nil {
 		// Return empty data on error
 		return dash.S3BucketsData{
@@ -480,6 +505,11 @@ func (h *AdminHandlers) getS3BucketsData(r *http.Request) dash.S3BucketsData {
 			TotalBuckets: 0,
 			TotalSize:    0,
 			LastUpdated:  time.Now(),
+			CurrentPage:  1,
+			TotalPages:   1,
+			PageSize:     pageSize,
+			SortBy:       sortBy,
+			SortOrder:    sortOrder,
 		}
 	}
 

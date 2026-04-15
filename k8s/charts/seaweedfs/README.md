@@ -49,6 +49,35 @@ CREATE TABLE IF NOT EXISTS `filemeta` (
 
 Alternative database can also be configured (e.g. leveldb, postgres) following the instructions at `filer.extraEnvironmentVars`.
 
+#### RocksDB variant
+
+The `_large_disk_rocksdb` image tag ships with RocksDB pre-configured as the filer backend.
+To use this image with the Helm chart, override the image on all three components and disable
+the chart's default `WEED_LEVELDB2_ENABLED`, which would otherwise re-enable LevelDB2 and
+override the image's built-in RocksDB configuration:
+
+```yaml
+# Replace <VERSION> with the desired seaweedfs version, e.g. 3.80_large_disk_rocksdb.
+master:
+  imageOverride: chrislusf/seaweedfs:<VERSION>_large_disk_rocksdb
+
+volume:
+  imageOverride: chrislusf/seaweedfs:<VERSION>_large_disk_rocksdb
+
+filer:
+  enablePVC: true
+  imageOverride: chrislusf/seaweedfs:<VERSION>_large_disk_rocksdb
+  extraEnvironmentVars:
+    WEED_LEVELDB2_ENABLED: "false"
+```
+
+Notes:
+
+* `master` and `volume` use the same image tag so that all components share a consistent
+  SeaweedFS build; RocksDB itself is only used by the filer.
+* `filer.enablePVC: true` (or another form of persistent storage for the filer) is required
+  so that the RocksDB metadata store survives pod restarts — otherwise metadata will be lost.
+
 ### Node Labels
 Kubernetes nodes can have labels which help to define which node(Host) will run which pod:
 
@@ -165,8 +194,9 @@ admin:
   enabled: true
   port: 23646
   grpcPort: 33646  # For worker connections
-  adminUser: "admin"
-  adminPassword: "your-secure-password"  # Leave empty to disable auth
+  secret:
+    adminUser: "admin"
+    adminPassword: "your-secure-password"  # Leave empty to disable auth
   
   # Optional: persist admin data
   data:
@@ -190,6 +220,8 @@ If `adminPassword` is set, the admin interface requires authentication:
 - Password: Value of `adminPassword`
 
 If `adminPassword` is empty or not set, the admin interface runs without authentication (not recommended for production).
+
+As an alternative, a kubernetes Secret can be used (`admin.secret.existingSecret`).
 
 ### Admin Data Persistence
 

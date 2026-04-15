@@ -3,7 +3,6 @@ package source
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -16,11 +15,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
 )
-
-type ReplicationSource interface {
-	ReadPart(part string) io.ReadCloser
-}
 
 type FilerSource struct {
 	grpcAddress    string
@@ -30,6 +26,7 @@ type FilerSource struct {
 	proxyByFiler   bool
 	dataCenter     string
 	signature      int32
+	httpClient     *util_http_client.HTTPClient
 }
 
 func (fs *FilerSource) Initialize(configuration util.Configuration, prefix string) error {
@@ -53,6 +50,14 @@ func (fs *FilerSource) DoInitialize(address, grpcAddress string, dir string, rea
 	fs.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 	fs.proxyByFiler = readChunkFromFiler
 	return nil
+}
+
+func (fs *FilerSource) SetGrpcDialOption(option grpc.DialOption) {
+	fs.grpcDialOption = option
+}
+
+func (fs *FilerSource) SetHttpClient(client *util_http_client.HTTPClient) {
+	fs.httpClient = client
 }
 
 func (fs *FilerSource) LookupFileId(ctx context.Context, part string) (fileUrls []string, err error) {
@@ -104,14 +109,20 @@ func (fs *FilerSource) LookupFileId(ctx context.Context, part string) (fileUrls 
 	return
 }
 
-func (fs *FilerSource) ReadPart(fileId string) (filename string, header http.Header, resp *http.Response, err error) {
+func (fs *FilerSource) ReadPart(fileId string, offset int64) (filename string, header http.Header, resp *http.Response, err error) {
+	downloadFn := util_http.DownloadFile
+	if fs.httpClient != nil {
+		downloadFn = func(fileUrl string, jwt string, offset ...int64) (string, http.Header, *http.Response, error) {
+			return util_http.DownloadFileWithClient(fs.httpClient, fileUrl, jwt, offset...)
+		}
+	}
 
 	if fs.proxyByFiler {
-		filename, header, resp, err = util_http.DownloadFile("http://"+fs.address+"/?proxyChunkId="+fileId, "")
+		filename, header, resp, err = downloadFn("http://"+fs.address+"/?proxyChunkId="+fileId, "", offset)
 		if err != nil {
-			glog.V(0).Infof("read part %s via filer proxy %s: %v", fileId, fs.address, err)
+			glog.V(0).Infof("read part %s via filer proxy %s offset %d: %v", fileId, fs.address, offset, err)
 		} else {
-			glog.V(4).Infof("read part %s via filer proxy %s content-length:%s", fileId, fs.address, header.Get("Content-Length"))
+			glog.V(4).Infof("read part %s via filer proxy %s offset %d content-length:%s", fileId, fs.address, offset, header.Get("Content-Length"))
 		}
 		return
 	}
@@ -122,11 +133,11 @@ func (fs *FilerSource) ReadPart(fileId string) (filename string, header http.Hea
 	}
 
 	for _, fileUrl := range fileUrls {
-		filename, header, resp, err = util_http.DownloadFile(fileUrl, "")
+		filename, header, resp, err = downloadFn(fileUrl, "", offset)
 		if err != nil {
-			glog.V(0).Infof("fail to read part %s from %s: %v", fileId, fileUrl, err)
+			glog.V(0).Infof("fail to read part %s from %s offset %d: %v", fileId, fileUrl, offset, err)
 		} else {
-			glog.V(4).Infof("read part %s from %s content-length:%s", fileId, fileUrl, header.Get("Content-Length"))
+			glog.V(4).Infof("read part %s from %s offset %d content-length:%s", fileId, fileUrl, offset, header.Get("Content-Length"))
 			break
 		}
 	}

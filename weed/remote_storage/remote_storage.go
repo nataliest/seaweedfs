@@ -1,6 +1,7 @@
 package remote_storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -75,6 +76,7 @@ var ErrRemoteObjectNotFound = errors.New("remote object not found")
 
 type RemoteStorageClient interface {
 	Traverse(loc *remote_pb.RemoteStorageLocation, visitFn VisitFunc) error
+	ListDirectory(ctx context.Context, loc *remote_pb.RemoteStorageLocation, visitFn VisitFunc) error
 	StatFile(loc *remote_pb.RemoteStorageLocation) (remoteEntry *filer_pb.RemoteEntry, err error)
 	ReadFile(loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (data []byte, err error)
 	WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error)
@@ -85,6 +87,12 @@ type RemoteStorageClient interface {
 	ListBuckets() ([]*Bucket, error)
 	CreateBucket(name string) (err error)
 	DeleteBucket(name string) (err error)
+}
+
+// RemoteStorageConcurrentReader is an optional interface for remote storage clients
+// that support configurable download concurrency for multipart downloads.
+type RemoteStorageConcurrentReader interface {
+	ReadFileWithConcurrency(loc *remote_pb.RemoteStorageLocation, offset int64, size int64, concurrency int) (data []byte, err error)
 }
 
 type RemoteStorageClientMaker interface {
@@ -107,17 +115,6 @@ func GetAllRemoteStorageNames() string {
 	var storageNames []string
 	for k := range RemoteStorageClientMakers {
 		storageNames = append(storageNames, k)
-	}
-	sort.Strings(storageNames)
-	return strings.Join(storageNames, "|")
-}
-
-func GetRemoteStorageNamesHasBucket() string {
-	var storageNames []string
-	for k, m := range RemoteStorageClientMakers {
-		if m.HasBucket() {
-			storageNames = append(storageNames, k)
-		}
 	}
 	sort.Strings(storageNames)
 	return strings.Join(storageNames, "|")

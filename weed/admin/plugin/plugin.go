@@ -69,6 +69,8 @@ type Plugin struct {
 	detectorLeaseMu sync.Mutex
 	detectorLeases  map[string]string
 
+	lanes map[SchedulerLane]*schedulerLaneState
+
 	schedulerExecMu           sync.Mutex
 	schedulerExecReservations map[string]int
 	adminScriptRunMu          sync.RWMutex
@@ -78,8 +80,6 @@ type Plugin struct {
 	schedulerRun              map[string]*schedulerRunInfo
 	schedulerLoopMu           sync.Mutex
 	schedulerLoopState        schedulerLoopState
-	schedulerConfigMu         sync.RWMutex
-	schedulerConfig           SchedulerConfig
 	schedulerWakeCh           chan struct{}
 
 	dedupeMu           sync.Mutex
@@ -122,6 +122,7 @@ type Plugin struct {
 type streamSession struct {
 	workerID  string
 	outgoing  chan *plugin_pb.AdminToWorkerMessage
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -160,6 +161,11 @@ func New(options Options) (*Plugin, error) {
 		schedulerTick = defaultSchedulerTick
 	}
 
+	lanes := make(map[SchedulerLane]*schedulerLaneState, len(AllLanes()))
+	for _, lane := range AllLanes() {
+		lanes[lane] = newLaneState(lane)
+	}
+
 	plugin := &Plugin{
 		store:                     store,
 		registry:                  NewRegistry(),
@@ -169,6 +175,7 @@ func New(options Options) (*Plugin, error) {
 		clusterContextProvider:    options.ClusterContextProvider,
 		configDefaultsProvider:    options.ConfigDefaultsProvider,
 		lockManager:               options.LockManager,
+		lanes:                     lanes,
 		sessions:                  make(map[string]*streamSession),
 		pendingSchema:             make(map[string]chan *plugin_pb.ConfigSchemaResponse),
 		pendingDetection:          make(map[string]*pendingDetectionState),
@@ -188,28 +195,15 @@ func New(options Options) (*Plugin, error) {
 	}
 	plugin.ctx, plugin.ctxCancel = context.WithCancel(context.Background())
 
-	if cfg, err := plugin.store.LoadSchedulerConfig(); err != nil {
-		glog.Warningf("Plugin failed to load scheduler config: %v", err)
-		plugin.schedulerConfig = DefaultSchedulerConfig()
-	} else if cfg == nil {
-		defaults := DefaultSchedulerConfig()
-		plugin.schedulerConfig = defaults
-		if plugin.store.IsConfigured() {
-			if err := plugin.store.SaveSchedulerConfig(&defaults); err != nil {
-				glog.Warningf("Plugin failed to persist scheduler defaults: %v", err)
-			}
-		}
-	} else {
-		plugin.schedulerConfig = normalizeSchedulerConfig(*cfg)
-	}
-
 	if err := plugin.loadPersistedMonitorState(); err != nil {
 		glog.Warningf("Plugin failed to load persisted monitoring state: %v", err)
 	}
 
 	if plugin.clusterContextProvider != nil {
-		plugin.wg.Add(1)
-		go plugin.schedulerLoop()
+		for _, ls := range plugin.lanes {
+			plugin.wg.Add(1)
+			go plugin.laneSchedulerLoop(ls)
+		}
 	}
 	plugin.wg.Add(1)
 	go plugin.persistenceLoop()
@@ -281,6 +275,7 @@ func (r *Plugin) WorkerStream(stream plugin_pb.PluginControlService_WorkerStream
 	session := &streamSession{
 		workerID: workerID,
 		outgoing: make(chan *plugin_pb.AdminToWorkerMessage, r.outgoingBuffer),
+		done:     make(chan struct{}),
 	}
 	r.putSession(session)
 	defer r.cleanupSession(workerID)
@@ -409,7 +404,6 @@ func (r *Plugin) SaveJobTypeConfig(config *plugin_pb.PersistedJobTypeConfig) err
 	return nil
 }
 
-
 func (r *Plugin) LoadDescriptor(jobType string) (*plugin_pb.JobTypeDescriptor, error) {
 	return r.store.LoadDescriptor(jobType)
 }
@@ -424,31 +418,6 @@ func (r *Plugin) IsConfigured() bool {
 
 func (r *Plugin) BaseDir() string {
 	return r.store.BaseDir()
-}
-
-func (r *Plugin) GetSchedulerConfig() SchedulerConfig {
-	if r == nil {
-		return DefaultSchedulerConfig()
-	}
-	r.schedulerConfigMu.RLock()
-	cfg := r.schedulerConfig
-	r.schedulerConfigMu.RUnlock()
-	return normalizeSchedulerConfig(cfg)
-}
-
-func (r *Plugin) UpdateSchedulerConfig(cfg SchedulerConfig) (SchedulerConfig, error) {
-	if r == nil {
-		return DefaultSchedulerConfig(), fmt.Errorf("plugin is not initialized")
-	}
-	normalized := normalizeSchedulerConfig(cfg)
-	if err := r.store.SaveSchedulerConfig(&normalized); err != nil {
-		return SchedulerConfig{}, err
-	}
-	r.schedulerConfigMu.Lock()
-	r.schedulerConfig = normalized
-	r.schedulerConfigMu.Unlock()
-	r.wakeScheduler()
-	return normalized, nil
 }
 
 func (r *Plugin) acquireAdminLock(reason string) (func(), error) {
@@ -730,6 +699,11 @@ func (r *Plugin) executeJobWithExecutor(
 	}
 }
 
+// HasCapableWorker checks if any non-stale worker has a capability for the given job type.
+func (r *Plugin) HasCapableWorker(jobType string) bool {
+	return r.registry.HasCapableWorker(jobType)
+}
+
 func (r *Plugin) ListWorkers() []*WorkerSession {
 	return r.registry.List()
 }
@@ -936,8 +910,10 @@ func (r *Plugin) sendLoop(
 			return nil
 		case <-r.shutdownCh:
 			return nil
-		case msg, ok := <-session.outgoing:
-			if !ok {
+		case <-session.done:
+			return nil
+		case msg := <-session.outgoing:
+			if msg == nil {
 				return nil
 			}
 			if err := stream.Send(msg); err != nil {
@@ -958,6 +934,8 @@ func (r *Plugin) sendToWorker(workerID string, message *plugin_pb.AdminToWorkerM
 	select {
 	case <-r.shutdownCh:
 		return fmt.Errorf("plugin is shutting down")
+	case <-session.done:
+		return fmt.Errorf("worker %s session is closed", workerID)
 	case session.outgoing <- message:
 		return nil
 	case <-time.After(r.sendTimeout):
@@ -1066,6 +1044,7 @@ func (r *Plugin) ensureJobTypeConfigFromDescriptor(jobType string, descriptor *p
 			RetryLimit:                    defaults.RetryLimit,
 			RetryBackoffSeconds:           defaults.RetryBackoffSeconds,
 			JobTypeMaxRuntimeSeconds:      defaults.JobTypeMaxRuntimeSeconds,
+			ExecutionTimeoutSeconds:       defaults.ExecutionTimeoutSeconds,
 		}
 	}
 
@@ -1453,6 +1432,16 @@ func CloneConfigValueMap(in map[string]*plugin_pb.ConfigValue) map[string]*plugi
 
 func (s *streamSession) close() {
 	s.closeOnce.Do(func() {
-		close(s.outgoing)
+		close(s.done)
 	})
+}
+
+// WorkerConnectForTest simulates a worker connecting (test helper).
+func (r *Plugin) WorkerConnectForTest(hello *plugin_pb.WorkerHello) {
+	r.registry.UpsertFromHello(hello)
+}
+
+// WorkerDisconnectForTest simulates a worker disconnecting (test helper).
+func (r *Plugin) WorkerDisconnectForTest(workerID string) {
+	r.registry.Remove(workerID)
 }

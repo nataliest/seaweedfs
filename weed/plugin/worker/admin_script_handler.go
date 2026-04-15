@@ -22,7 +22,7 @@ const (
 	adminScriptJobType        = "admin_script"
 	maxAdminScriptOutputBytes = 16 * 1024
 	defaultAdminScriptRunMins = 17
-	adminScriptDetectTickSecs = 60
+	adminScriptDetectTickSecs = 17 * 60
 )
 
 const defaultAdminScript = `ec.balance -apply
@@ -123,6 +123,7 @@ func (h *AdminScriptHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 			RetryLimit:                    0,
 			RetryBackoffSeconds:           30,
 			JobTypeMaxRuntimeSeconds:      1800,
+			ExecutionTimeoutSeconds:       1800,
 		},
 		WorkerDefaultValues: map[string]*plugin_pb.ConfigValue{},
 	}
@@ -284,6 +285,7 @@ func (h *AdminScriptHandler) Execute(ctx context.Context, request *plugin_pb.Exe
 		_, _ = fmt.Fprintf(output, "$ %s\n", commandLine)
 
 		found := false
+		sendBroken := false
 		for _, command := range shell.Commands {
 			if command.Name() != cmd.Name {
 				continue
@@ -292,7 +294,7 @@ func (h *AdminScriptHandler) Execute(ctx context.Context, request *plugin_pb.Exe
 			if err := command.Do(cmd.Args, commandEnv, output); err != nil {
 				msg := fmt.Sprintf("%s: %v", cmd.Name, err)
 				errorMessages = append(errorMessages, msg)
-				_ = sender.SendProgress(&plugin_pb.JobProgressUpdate{
+				if sendErr := sender.SendProgress(&plugin_pb.JobProgressUpdate{
 					State:           plugin_pb.JobState_JOB_STATE_RUNNING,
 					ProgressPercent: percentProgress(executed+1, len(execCommands)),
 					Stage:           "error",
@@ -300,15 +302,20 @@ func (h *AdminScriptHandler) Execute(ctx context.Context, request *plugin_pb.Exe
 					Activities: []*plugin_pb.ActivityEvent{
 						BuildExecutorActivity("error", msg),
 					},
-				})
+				}); sendErr != nil {
+					sendBroken = true
+				}
 			}
+			break
+		}
+		if sendBroken {
 			break
 		}
 
 		if !found {
 			msg := fmt.Sprintf("unknown admin command: %s", cmd.Name)
 			errorMessages = append(errorMessages, msg)
-			_ = sender.SendProgress(&plugin_pb.JobProgressUpdate{
+			if sendErr := sender.SendProgress(&plugin_pb.JobProgressUpdate{
 				State:           plugin_pb.JobState_JOB_STATE_RUNNING,
 				ProgressPercent: percentProgress(executed+1, len(execCommands)),
 				Stage:           "error",
@@ -316,12 +323,14 @@ func (h *AdminScriptHandler) Execute(ctx context.Context, request *plugin_pb.Exe
 				Activities: []*plugin_pb.ActivityEvent{
 					BuildExecutorActivity("error", msg),
 				},
-			})
+			}); sendErr != nil {
+				break
+			}
 		}
 
 		executed++
 		progress := percentProgress(executed, len(execCommands))
-		_ = sender.SendProgress(&plugin_pb.JobProgressUpdate{
+		if sendErr := sender.SendProgress(&plugin_pb.JobProgressUpdate{
 			State:           plugin_pb.JobState_JOB_STATE_RUNNING,
 			ProgressPercent: progress,
 			Stage:           "running",
@@ -329,7 +338,9 @@ func (h *AdminScriptHandler) Execute(ctx context.Context, request *plugin_pb.Exe
 			Activities: []*plugin_pb.ActivityEvent{
 				BuildExecutorActivity("running", commandLine),
 			},
-		})
+		}); sendErr != nil {
+			break
+		}
 	}
 
 	scriptHash := hashAdminScript(script)

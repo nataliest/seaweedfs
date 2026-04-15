@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -95,7 +96,7 @@ func init() {
 	m.metricsIntervalSec = cmdMaster.Flag.Int("metrics.intervalSeconds", 15, "Prometheus push interval in seconds")
 	m.metricsHttpPort = cmdMaster.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	m.metricsHttpIp = cmdMaster.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
-	m.raftResumeState = cmdMaster.Flag.Bool("resumeState", false, "resume previous state on start master server")
+	m.raftResumeState = cmdMaster.Flag.Bool("resumeState", true, "resume previous state on start master server")
 	m.heartbeatInterval = cmdMaster.Flag.Duration("heartbeatInterval", 300*time.Millisecond, "heartbeat interval of master servers, and will be randomly multiplied by [1, 1.25)")
 	m.electionTimeout = cmdMaster.Flag.Duration("electionTimeout", 10*time.Second, "election timeout of master servers")
 	m.raftHashicorp = cmdMaster.Flag.Bool("raftHashicorp", false, "use hashicorp raft")
@@ -207,6 +208,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		DataDir:           util.ResolvePath(metaDir),
 		Topo:              ms.Topo,
 		RaftResumeState:   *masterOption.raftResumeState,
+		SingleMaster:      isSingleMaster,
 		HeartbeatInterval: *masterOption.heartbeatInterval,
 		ElectionTimeout:   *masterOption.electionTimeout,
 		RaftBootstrap:     *masterOption.raftBootstrap,
@@ -222,8 +224,13 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		if raftServer == nil {
 			glog.Fatalf("please verify %s is writable, see https://github.com/seaweedfs/seaweedfs/issues/717: %s", *masterOption.metaFolder, err)
 		}
-		// For single-master mode, initialize cluster immediately without waiting
-		if isSingleMaster {
+		// For single-master mode with a fresh log, initialize cluster immediately.
+		// When resuming with existing state, the server is already a member and
+		// will self-elect via fastResume — sending another JoinCommand would block
+		// because goraft's setCommitIndex returns early on JoinCommand entries,
+		// preventing the new entry's event from being notified when old uncommitted
+		// JoinCommands exist in the log.
+		if isSingleMaster && !raftServer.HasExistingState() {
 			glog.V(0).Infof("Single-master mode: initializing cluster immediately")
 			raftServer.DoJoinCommand()
 		}
@@ -253,16 +260,32 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		go grpcS.Serve(grpcLocalL)
 	}
 	go grpcS.Serve(grpcL)
+	pb.ServeGrpcOnLocalSocket(grpcS, grpcPort)
 
 	// For multi-master mode with non-Hashicorp raft, wait and check if we should join
 	if !*masterOption.raftHashicorp && !isSingleMaster {
 		go func() {
-			time.Sleep(raftJoinCheckDelay)
+			// Stagger bootstrap by peer index so masters don't all check
+			// simultaneously. Peer 0 waits ~1.5s, peer 1 ~3s, etc.
+			idx := peerIndex(myMasterAddress, peers)
+			delay := time.Duration(float64(raftJoinCheckDelay) * (rand.Float64()*0.25 + 1) * float64(idx+1))
+			glog.V(0).Infof("bootstrap check in %v (peer index %d of %d)", delay, idx, len(peers))
+			time.Sleep(delay)
 
 			ms.Topo.RaftServerAccessLock.RLock()
 			isEmptyMaster := ms.Topo.RaftServer.Leader() == "" && ms.Topo.RaftServer.IsLogEmpty()
-			if isEmptyMaster && isTheFirstOne(myMasterAddress, peers) && ms.MasterClient.FindLeaderFromOtherPeers(myMasterAddress) == "" {
-				raftServer.DoJoinCommand()
+			isFirst := idx == 0
+			if isEmptyMaster && isFirst {
+				existingLeader := ms.MasterClient.FindLeaderFromOtherPeers(myMasterAddress)
+				if existingLeader == "" {
+					raftServer.DoJoinCommand()
+				} else {
+					glog.V(0).Infof("skip bootstrap: existing leader %s found from peers", existingLeader)
+				}
+			} else if !isEmptyMaster {
+				glog.V(0).Infof("skip bootstrap: leader=%q logEmpty=%v", ms.Topo.RaftServer.Leader(), ms.Topo.RaftServer.IsLogEmpty())
+			} else {
+				glog.V(0).Infof("skip bootstrap: %v is not the first master in peers (index %d)", myMasterAddress, idx)
 			}
 			ms.Topo.RaftServerAccessLock.RUnlock()
 		}()
@@ -385,14 +408,19 @@ func normalizeMasterPeerAddress(peer pb.ServerAddress, self pb.ServerAddress) pb
 	return pb.NewServerAddressWithGrpcPort(peer.ToHttpAddress(), grpcPortValue)
 }
 
-func isTheFirstOne(self pb.ServerAddress, peers []pb.ServerAddress) bool {
+// peerIndex returns the 0-based position of self in the sorted peer list.
+// Peer 0 is the designated bootstrap node. Returns -1 if self is not found.
+func peerIndex(self pb.ServerAddress, peers []pb.ServerAddress) int {
 	slices.SortFunc(peers, func(a, b pb.ServerAddress) int {
 		return strings.Compare(a.ToHttpAddress(), b.ToHttpAddress())
 	})
-	if len(peers) <= 0 {
-		return true
+	for i, peer := range peers {
+		if peer.ToHttpAddress() == self.ToHttpAddress() {
+			return i
+		}
 	}
-	return self.ToHttpAddress() == peers[0].ToHttpAddress()
+	glog.Warningf("peerIndex: self %s not found in peers %v", self, peers)
+	return -1
 }
 
 func (m *MasterOptions) toMasterOption(whiteList []string) *weed_server.MasterOption {

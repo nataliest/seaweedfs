@@ -24,9 +24,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
-	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // corsHeaders defines the CORS headers that need to be preserved
@@ -244,14 +245,17 @@ func (e *StreamError) Unwrap() error {
 	return e.Err
 }
 
-// newStreamError creates a StreamError for cases where response hasn't been written yet
-func newStreamError(err error) *StreamError {
-	return &StreamError{Err: err, ResponseWritten: false}
-}
-
 // newStreamErrorWithResponse creates a StreamError for cases where response was already written
 func newStreamErrorWithResponse(err error) *StreamError {
 	return &StreamError{Err: err, ResponseWritten: true}
+}
+
+func isCanceledStreamingError(err error) bool {
+	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
+}
+
+func shouldWriteStreamingErrorResponse(err error) bool {
+	return err != nil && !isCanceledStreamingError(err)
 }
 
 func mimeDetect(r *http.Request, dataReader io.Reader) io.ReadCloser {
@@ -262,15 +266,6 @@ func mimeDetect(r *http.Request, dataReader io.Reader) io.ReadCloser {
 		return io.NopCloser(io.MultiReader(bytes.NewReader(mimeBuffer[:size]), dataReader))
 	}
 	return io.NopCloser(dataReader)
-}
-
-func urlEscapeObject(object string) string {
-	normalized := s3_constants.NormalizeObjectKey(object)
-	// Ensure leading slash for filer paths
-	if normalized != "" && !strings.HasPrefix(normalized, "/") {
-		normalized = "/" + normalized
-	}
-	return urlPathEscape(normalized)
 }
 
 func entryUrlEncode(dir string, entry string, encodingTypeUrl bool) (dirName string, entryName string, prefix string) {
@@ -885,7 +880,15 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 	err = s3a.streamFromVolumeServersWithSSE(w, r, objectEntryForSSE, primarySSEType, bucket, object, versionId)
 	streamTime = time.Since(tStream)
 	if err != nil {
-		glog.Errorf("GetObjectHandler: failed to stream %s/%s from volume servers: %v", bucket, object, err)
+		switch {
+		case isCanceledStreamingError(err):
+			glog.V(3).Infof("GetObjectHandler: client disconnected while streaming %s/%s: %v", bucket, object, err)
+			return
+		case errors.Is(err, context.DeadlineExceeded):
+			glog.Warningf("GetObjectHandler: deadline exceeded while streaming %s/%s: %v", bucket, object, err)
+		default:
+			glog.Errorf("GetObjectHandler: failed to stream %s/%s from volume servers: %v", bucket, object, err)
+		}
 		// Check if the streaming function already wrote an HTTP response
 		var streamErr *StreamError
 		if errors.As(err, &streamErr) && streamErr.ResponseWritten {
@@ -897,7 +900,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 		// Check if error is due to volume server rate limiting (HTTP 429)
 		if errors.Is(err, util_http.ErrTooManyRequests) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
-		} else {
+		} else if shouldWriteStreamingErrorResponse(err) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		}
 		return
@@ -1023,41 +1026,48 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// CRITICAL: Resolve chunks and prepare stream BEFORE WriteHeader
-	// This ensures we can write proper error responses if these operations fail
+	// CRITICAL: Resolve chunks and prepare reader BEFORE WriteHeader so failures
+	// can still return a proper S3 error response.
 	ctx := r.Context()
 	lookupFileIdFn := s3a.createLookupFileIdFunction()
 
-	// Resolve chunk manifests with the requested range
+	// Resolve chunk manifests into visible intervals for the requested range.
+	// NonOverlappingVisibleIntervals internally calls ResolveChunkManifest.
 	tChunkResolve := time.Now()
-	resolvedChunks, _, err := filer.ResolveChunkManifest(ctx, lookupFileIdFn, chunks, offset, offset+size)
+	visibleIntervals, err := filer.NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, offset, offset+size)
 	chunkResolveTime = time.Since(tChunkResolve)
 	if err != nil {
-		glog.Errorf("streamFromVolumeServers: failed to resolve chunks: %v", err)
+		if isCanceledStreamingError(err) {
+			glog.V(3).Infof("streamFromVolumeServers: request canceled while resolving chunks: %v", err)
+			return err
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			glog.Warningf("streamFromVolumeServers: request deadline exceeded while resolving chunks: %v", err)
+		} else {
+			glog.Errorf("streamFromVolumeServers: failed to resolve chunks: %v", err)
+		}
 		// Write S3-compliant XML error response
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return newStreamErrorWithResponse(fmt.Errorf("failed to resolve chunks: %v", err))
 	}
 
-	// Prepare streaming function with simple master client wrapper
+	// Build a ChunkReadAt backed by the server-wide ReaderCache. This mirrors
+	// the WebDAV read path (server/webdav_server.go) and outperforms the
+	// io.Pipe-based streamChunksPrefetched path: ReaderCache prefetches whole
+	// chunks into memory buffers that the consumer can memcpy out of, so
+	// prefetchCount translates into actual in-flight bytes rather than just
+	// parallel TCP handshakes.
+	//
+	// We do NOT call reader.Close() here — ChunkReadAt.Close() would destroy
+	// the ReaderCache's downloaders map, which is shared across concurrent
+	// requests. Eviction is handled by the ReaderCache's own downloader
+	// limit. JWT for volume-server requests is generated internally by
+	// util_http.RetriedFetchChunkData from jwtSigningReadKey, matching the
+	// WebDAV and mount read paths.
 	tStreamPrep := time.Now()
-	// Use filerClient directly (not wrapped) so it can support cache invalidation
-	streamFn, err := filer.PrepareStreamContentWithThrottler(
-		ctx,
-		s3a.filerClient,
-		filer.JwtForVolumeServer, // Use filer's JWT function (loads config once, generates JWT locally)
-		resolvedChunks,
-		offset,
-		size,
-		0, // no throttling
-	)
+	chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, offset, size)
+	reader := filer.NewChunkReaderAtFromClient(ctx, s3a.readerCache, chunkViews, totalSize, filer.DefaultPrefetchCount)
 	streamPrepTime = time.Since(tStreamPrep)
-	if err != nil {
-		glog.Errorf("streamFromVolumeServers: failed to prepare stream: %v", err)
-		// Write S3-compliant XML error response
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		return newStreamErrorWithResponse(fmt.Errorf("failed to prepare stream: %v", err))
-	}
 
 	// All validation and preparation successful - NOW set headers and write status
 	tHeaderSet := time.Now()
@@ -1082,11 +1092,22 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 	// Track time to first byte metric
 	TimeToFirstByte(r.Method, t0, r)
 
-	// Stream directly to response with counting wrapper
+	// Stream directly to response with counting wrapper.
+	// ChunkReadAt's ReadAt is backed by in-memory prefetched chunk buffers, so
+	// io.CopyBuffer drains them as fast memcpys.
 	tStreamExec := time.Now()
-	glog.V(4).Infof("streamFromVolumeServers: starting streamFn, offset=%d, size=%d", offset, size)
+	glog.V(4).Infof("streamFromVolumeServers: starting chunk reader, offset=%d, size=%d", offset, size)
 	cw := &countingWriter{w: w}
-	err = streamFn(cw)
+	// Cap the copy buffer to the response size so small-object GETs (common
+	// for thumbnails, config files, etc.) don't allocate a 256 KiB scratch
+	// buffer per request.
+	const maxCopyBuf = 256 * 1024
+	copyBufSize := int64(maxCopyBuf)
+	if size > 0 && size < copyBufSize {
+		copyBufSize = size
+	}
+	copyBuf := make([]byte, copyBufSize)
+	_, err = io.CopyBuffer(cw, io.NewSectionReader(reader, offset, size), copyBuf)
 	streamExecTime = time.Since(tStreamExec)
 	// Track traffic even on partial writes for accurate egress accounting
 	if cw.written > 0 {
@@ -1094,7 +1115,7 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 	}
 	if err != nil {
 		switch {
-		case errors.Is(err, context.Canceled):
+		case isCanceledStreamingError(err):
 			// Client disconnected mid-stream (e.g. Nginx upstream timeout, browser cancel) - expected
 			glog.V(3).Infof("streamFromVolumeServers: client disconnected after writing %d bytes: %v", cw.written, err)
 		case errors.Is(err, context.DeadlineExceeded):
@@ -1909,7 +1930,7 @@ func (s3a *S3ApiServer) getEncryptedStreamFromVolumes(ctx context.Context, entry
 	}
 
 	// Create streaming reader - use filerClient directly for cache invalidation support
-	streamFn, err := filer.PrepareStreamContentWithThrottler(
+	streamFn, err := filer.PrepareStreamContentWithPrefetch(
 		ctx,
 		s3a.filerClient,
 		filer.JwtForVolumeServer, // Use filer's JWT function (loads config once, generates JWT locally)
@@ -1917,6 +1938,7 @@ func (s3a *S3ApiServer) getEncryptedStreamFromVolumes(ctx context.Context, entry
 		0,
 		totalSize,
 		0,
+		4, // prefetch 4 chunks ahead for overlapped fetching
 	)
 	if err != nil {
 		return nil, err
@@ -2019,12 +2041,7 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 		for k, v := range entry.Extended {
 			// Skip internal SeaweedFS headers
 			if !strings.HasPrefix(k, "xattr-") && !s3_constants.IsSeaweedFSInternalHeader(k) {
-				// Skip S3 Additional Checksum headers here; they are handled
-				// explicitly below with x-amz-checksum-mode gating.
-				if strings.HasPrefix(k, "x-amz-checksum-") {
-					continue
-				}
-				// Support backward compatibility: migrate old non-canonical format to canonical format
+					// Support backward compatibility: migrate old non-canonical format to canonical format
 				// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
 				headerKey := k
 				if len(k) >= 11 && strings.EqualFold(k[:11], "x-amz-meta-") {
@@ -2041,21 +2058,6 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	// Return S3 Additional Checksum headers from entry.Extended.
-	// Per AWS S3 spec: GET always returns stored checksums; HEAD only returns them
-	// when the request includes x-amz-checksum-mode: ENABLED.
-	if entry.Extended != nil {
-		includeChecksums := r.Method != http.MethodHead ||
-			strings.EqualFold(r.Header.Get(s3_constants.AmzChecksumMode), "ENABLED")
-		if includeChecksums {
-			for _, key := range s3_constants.S3ChecksumHeaders {
-				if v, ok := entry.Extended[key]; ok {
-					w.Header().Set(key, string(v))
-				}
-			}
-		}
-	}
-
 	// Set tag count header (matches filer logic)
 	if entry.Extended != nil {
 		tagCount := 0
@@ -2066,6 +2068,21 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 		}
 		if tagCount > 0 {
 			w.Header().Set(s3_constants.AmzTagCount, strconv.Itoa(tagCount))
+		}
+	}
+
+	// Set checksum header if stored in metadata, but only when:
+	// 1. The request contains "x-amz-checksum-mode: ENABLED" (per AWS S3 spec)
+	// 2. The request is NOT a ranged GET (Range header absent)
+	//    The stored checksum covers the full object; returning it for partial
+	//    responses causes SDK checksum validation failures.
+	if r != nil && r.Header.Get("X-Amz-Checksum-Mode") == "ENABLED" && r.Header.Get("Range") == "" {
+		if entry.Extended != nil {
+			if algoName, ok := entry.Extended[s3_constants.ExtChecksumAlgorithm]; ok {
+				if checksumVal, ok := entry.Extended[s3_constants.ExtChecksumValue]; ok {
+					w.Header().Set(string(algoName), string(checksumVal))
+				}
+			}
 		}
 	}
 
@@ -2419,45 +2436,6 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusOK)
 }
 
-func captureCORSHeaders(w http.ResponseWriter, headersToCapture []string) map[string]string {
-	captured := make(map[string]string)
-	for _, corsHeader := range headersToCapture {
-		if value := w.Header().Get(corsHeader); value != "" {
-			captured[corsHeader] = value
-		}
-	}
-	return captured
-}
-
-func restoreCORSHeaders(w http.ResponseWriter, capturedCORSHeaders map[string]string) {
-	for corsHeader, value := range capturedCORSHeaders {
-		w.Header().Set(corsHeader, value)
-	}
-}
-
-// writeFinalResponse handles the common response writing logic shared between
-// passThroughResponse and handleSSECResponse
-func writeFinalResponse(w http.ResponseWriter, proxyResponse *http.Response, bodyReader io.Reader, capturedCORSHeaders map[string]string) (statusCode int, bytesTransferred int64) {
-	// Restore CORS headers that were set by middleware
-	restoreCORSHeaders(w, capturedCORSHeaders)
-
-	if proxyResponse.Header.Get("Content-Range") != "" && proxyResponse.StatusCode == 200 {
-		statusCode = http.StatusPartialContent
-	} else {
-		statusCode = proxyResponse.StatusCode
-	}
-	w.WriteHeader(statusCode)
-
-	// Stream response data
-	buf := mem.Allocate(128 * 1024)
-	defer mem.Free(buf)
-	bytesTransferred, err := io.CopyBuffer(w, bodyReader, buf)
-	if err != nil {
-		glog.V(1).Infof("response read %d bytes: %v", bytesTransferred, err)
-	}
-	return statusCode, bytesTransferred
-}
-
 // fetchObjectEntry fetches the filer entry for an object
 // Returns nil if not found (not an error), or propagates other errors
 func (s3a *S3ApiServer) fetchObjectEntry(bucket, object string) (*filer_pb.Entry, error) {
@@ -2481,187 +2459,6 @@ func (s3a *S3ApiServer) fetchObjectEntryRequired(bucket, object string) (*filer_
 		return nil, fetchErr // Return error for both not-found and other errors
 	}
 	return fetchedEntry, nil
-}
-
-// copyResponseHeaders copies headers from proxy response to the response writer,
-// excluding internal SeaweedFS headers and optionally excluding body-related headers
-func copyResponseHeaders(w http.ResponseWriter, proxyResponse *http.Response, excludeBodyHeaders bool) {
-	for k, v := range proxyResponse.Header {
-		// Always exclude internal SeaweedFS headers
-		if s3_constants.IsSeaweedFSInternalHeader(k) {
-			continue
-		}
-		// Optionally exclude body-related headers that might change after decryption
-		if excludeBodyHeaders && (k == "Content-Length" || k == "Content-Encoding") {
-			continue
-		}
-		w.Header()[k] = v
-	}
-}
-
-func passThroughResponse(proxyResponse *http.Response, w http.ResponseWriter) (statusCode int, bytesTransferred int64) {
-	// Capture existing CORS headers that may have been set by middleware
-	capturedCORSHeaders := captureCORSHeaders(w, corsHeaders)
-
-	// Copy headers from proxy response (excluding internal SeaweedFS headers)
-	copyResponseHeaders(w, proxyResponse, false)
-
-	return writeFinalResponse(w, proxyResponse, proxyResponse.Body, capturedCORSHeaders)
-}
-
-// handleSSECResponse handles SSE-C decryption and response processing
-func (s3a *S3ApiServer) handleSSECResponse(r *http.Request, proxyResponse *http.Response, w http.ResponseWriter, entry *filer_pb.Entry) (statusCode int, bytesTransferred int64) {
-	// Check if the object has SSE-C metadata
-	sseAlgorithm := proxyResponse.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm)
-	sseKeyMD5 := proxyResponse.Header.Get(s3_constants.AmzServerSideEncryptionCustomerKeyMD5)
-	isObjectEncrypted := sseAlgorithm != "" && sseKeyMD5 != ""
-
-	// Parse SSE-C headers from request once (avoid duplication)
-	customerKey, err := ParseSSECHeaders(r)
-	if err != nil {
-		errCode := MapSSECErrorToS3Error(err)
-		s3err.WriteErrorResponse(w, r, errCode)
-		return http.StatusBadRequest, 0
-	}
-
-	if isObjectEncrypted {
-		// This object was encrypted with SSE-C, validate customer key
-		if customerKey == nil {
-			s3err.WriteErrorResponse(w, r, s3err.ErrSSECustomerKeyMissing)
-			return http.StatusBadRequest, 0
-		}
-
-		// SSE-C MD5 is base64 and case-sensitive
-		if customerKey.KeyMD5 != sseKeyMD5 {
-			// For GET/HEAD requests, AWS S3 returns 403 Forbidden for a key mismatch.
-			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
-			return http.StatusForbidden, 0
-		}
-
-		// SSE-C encrypted objects support HTTP Range requests
-		// The IV is stored in metadata and CTR mode allows seeking to any offset
-		// Range requests will be handled by the filer layer with proper offset-based decryption
-
-		// Check if this is a chunked or small content SSE-C object
-		// Use the entry parameter passed from the caller (avoids redundant lookup)
-		if entry != nil {
-			// Check for SSE-C chunks
-			sseCChunks := 0
-			for _, chunk := range entry.GetChunks() {
-				if chunk.GetSseType() == filer_pb.SSEType_SSE_C {
-					sseCChunks++
-				}
-			}
-
-			if sseCChunks >= 1 {
-
-				// Handle chunked SSE-C objects - each chunk needs independent decryption
-				multipartReader, decErr := s3a.createMultipartSSECDecryptedReader(r, proxyResponse, entry)
-				if decErr != nil {
-					glog.Errorf("Failed to create multipart SSE-C decrypted reader: %v", decErr)
-					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-					return http.StatusInternalServerError, 0
-				}
-
-				// Capture existing CORS headers
-				capturedCORSHeaders := captureCORSHeaders(w, corsHeaders)
-
-				// Copy headers from proxy response (excluding internal SeaweedFS headers)
-				copyResponseHeaders(w, proxyResponse, false)
-
-				// Set proper headers for range requests
-				rangeHeader := r.Header.Get("Range")
-				if rangeHeader != "" {
-
-					// Parse range header (e.g., "bytes=0-99")
-					if len(rangeHeader) > 6 && rangeHeader[:6] == "bytes=" {
-						rangeSpec := rangeHeader[6:]
-						parts := strings.Split(rangeSpec, "-")
-						if len(parts) == 2 {
-							startOffset, endOffset := int64(0), int64(-1)
-							if parts[0] != "" {
-								startOffset, _ = strconv.ParseInt(parts[0], 10, 64)
-							}
-							if parts[1] != "" {
-								endOffset, _ = strconv.ParseInt(parts[1], 10, 64)
-							}
-
-							if endOffset >= startOffset {
-								// Specific range - set proper Content-Length and Content-Range headers
-								rangeLength := endOffset - startOffset + 1
-								totalSize := proxyResponse.Header.Get("Content-Length")
-
-								w.Header().Set("Content-Length", strconv.FormatInt(rangeLength, 10))
-								w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%s", startOffset, endOffset, totalSize))
-								// writeFinalResponse will set status to 206 if Content-Range is present
-							}
-						}
-					}
-				}
-
-				return writeFinalResponse(w, proxyResponse, multipartReader, capturedCORSHeaders)
-			} else if len(entry.GetChunks()) == 0 && len(entry.Content) > 0 {
-				// Small content SSE-C object stored directly in entry.Content
-
-				// Fall through to traditional single-object SSE-C handling below
-			}
-		}
-
-		// Single-part SSE-C object: Get IV from proxy response headers (stored during upload)
-		ivBase64 := proxyResponse.Header.Get(s3_constants.SeaweedFSSSEIVHeader)
-		if ivBase64 == "" {
-			glog.Errorf("SSE-C encrypted single-part object missing IV in metadata")
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return http.StatusInternalServerError, 0
-		}
-
-		iv, err := base64.StdEncoding.DecodeString(ivBase64)
-		if err != nil {
-			glog.Errorf("Failed to decode IV from metadata: %v", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return http.StatusInternalServerError, 0
-		}
-
-		// Create decrypted reader with IV from metadata
-		decryptedReader, decErr := CreateSSECDecryptedReader(proxyResponse.Body, customerKey, iv)
-		if decErr != nil {
-			glog.Errorf("Failed to create SSE-C decrypted reader: %v", decErr)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return http.StatusInternalServerError, 0
-		}
-
-		// Capture existing CORS headers that may have been set by middleware
-		capturedCORSHeaders := captureCORSHeaders(w, corsHeaders)
-
-		// Copy headers from proxy response (excluding body-related headers that might change and internal SeaweedFS headers)
-		copyResponseHeaders(w, proxyResponse, true)
-
-		// Set correct Content-Length for SSE-C (only for full object requests)
-		// With IV stored in metadata, the encrypted length equals the original length
-		if proxyResponse.Header.Get("Content-Range") == "" {
-			// Full object request: encrypted length equals original length (IV not in stream)
-			if contentLengthStr := proxyResponse.Header.Get("Content-Length"); contentLengthStr != "" {
-				// Content-Length is already correct since IV is stored in metadata, not in data stream
-				w.Header().Set("Content-Length", contentLengthStr)
-			}
-		}
-		// For range requests, let the actual bytes transferred determine the response length
-
-		// Add SSE-C response headers
-		w.Header().Set(s3_constants.AmzServerSideEncryptionCustomerAlgorithm, sseAlgorithm)
-		w.Header().Set(s3_constants.AmzServerSideEncryptionCustomerKeyMD5, sseKeyMD5)
-
-		return writeFinalResponse(w, proxyResponse, decryptedReader, capturedCORSHeaders)
-	} else {
-		// Object is not encrypted, but check if customer provided SSE-C headers unnecessarily
-		if customerKey != nil {
-			s3err.WriteErrorResponse(w, r, s3err.ErrSSECustomerKeyNotNeeded)
-			return http.StatusBadRequest, 0
-		}
-
-		// Normal pass-through response
-		return passThroughResponse(proxyResponse, w)
-	}
 }
 
 // addObjectLockHeadersToResponse extracts object lock metadata from entry Extended attributes
@@ -2703,54 +2500,6 @@ func (s3a *S3ApiServer) addObjectLockHeadersToResponse(w http.ResponseWriter, en
 		// but no legal hold specifically set, default to "OFF" as per AWS S3 behavior
 		w.Header().Set(s3_constants.AmzObjectLockLegalHold, s3_constants.LegalHoldOff)
 	}
-}
-
-// addSSEHeadersToResponse converts stored SSE metadata from entry.Extended to HTTP response headers
-// Uses intelligent prioritization: only set headers for the PRIMARY encryption type to avoid conflicts
-func (s3a *S3ApiServer) addSSEHeadersToResponse(proxyResponse *http.Response, entry *filer_pb.Entry) {
-	if entry == nil || entry.Extended == nil {
-		return
-	}
-
-	// Determine the primary encryption type by examining chunks (most reliable)
-	primarySSEType := s3a.detectPrimarySSEType(entry)
-
-	// Only set headers for the PRIMARY encryption type
-	switch primarySSEType {
-	case s3_constants.SSETypeC:
-		// Add only SSE-C headers
-		if algorithmBytes, exists := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm]; exists && len(algorithmBytes) > 0 {
-			proxyResponse.Header.Set(s3_constants.AmzServerSideEncryptionCustomerAlgorithm, string(algorithmBytes))
-		}
-
-		if keyMD5Bytes, exists := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5]; exists && len(keyMD5Bytes) > 0 {
-			proxyResponse.Header.Set(s3_constants.AmzServerSideEncryptionCustomerKeyMD5, string(keyMD5Bytes))
-		}
-
-		if ivBytes, exists := entry.Extended[s3_constants.SeaweedFSSSEIV]; exists && len(ivBytes) > 0 {
-			ivBase64 := base64.StdEncoding.EncodeToString(ivBytes)
-			proxyResponse.Header.Set(s3_constants.SeaweedFSSSEIVHeader, ivBase64)
-		}
-
-	case s3_constants.SSETypeKMS:
-		// Add only SSE-KMS headers
-		if sseAlgorithm, exists := entry.Extended[s3_constants.AmzServerSideEncryption]; exists && len(sseAlgorithm) > 0 {
-			proxyResponse.Header.Set(s3_constants.AmzServerSideEncryption, string(sseAlgorithm))
-		}
-
-		if kmsKeyID, exists := entry.Extended[s3_constants.AmzServerSideEncryptionAwsKmsKeyId]; exists && len(kmsKeyID) > 0 {
-			proxyResponse.Header.Set(s3_constants.AmzServerSideEncryptionAwsKmsKeyId, string(kmsKeyID))
-		}
-
-	case s3_constants.SSETypeS3:
-		// Add only SSE-S3 headers
-		proxyResponse.Header.Set(s3_constants.AmzServerSideEncryption, SSES3Algorithm)
-
-	default:
-		// Unencrypted or unknown - don't set any SSE headers
-	}
-
-	glog.V(3).Infof("addSSEHeadersToResponse: processed %d extended metadata entries", len(entry.Extended))
 }
 
 // detectPrimarySSEType determines the primary SSE type by examining chunk metadata
@@ -3153,193 +2902,6 @@ func (m *MultipartSSEReader) Close() error {
 		}
 	}
 	return lastErr
-}
-
-// Read implements the io.Reader interface for SSERangeReader
-func (r *SSERangeReader) Read(p []byte) (n int, err error) {
-	// Skip bytes iteratively (no recursion) until we reach the offset
-	for r.skipped < r.offset {
-		skipNeeded := r.offset - r.skipped
-
-		// Lazily allocate skip buffer on first use, reuse thereafter
-		if r.skipBuf == nil {
-			// Use a fixed 32KB buffer for skipping (avoids per-call allocation)
-			r.skipBuf = make([]byte, 32*1024)
-		}
-
-		// Determine how much to skip in this iteration
-		bufSize := int64(len(r.skipBuf))
-		if skipNeeded < bufSize {
-			bufSize = skipNeeded
-		}
-
-		skipRead, skipErr := r.reader.Read(r.skipBuf[:bufSize])
-		r.skipped += int64(skipRead)
-
-		if skipErr != nil {
-			return 0, skipErr
-		}
-
-		// Guard against infinite loop: io.Reader may return (0, nil)
-		// which is permitted by the interface contract for non-empty buffers.
-		// If we get zero bytes without an error, treat it as an unexpected EOF.
-		if skipRead == 0 {
-			return 0, io.ErrUnexpectedEOF
-		}
-	}
-
-	// If we have a remaining limit and it's reached
-	if r.remaining == 0 {
-		return 0, io.EOF
-	}
-
-	// Calculate how much to read
-	readSize := len(p)
-	if r.remaining > 0 && int64(readSize) > r.remaining {
-		readSize = int(r.remaining)
-	}
-
-	// Read the data
-	n, err = r.reader.Read(p[:readSize])
-	if r.remaining > 0 {
-		r.remaining -= int64(n)
-	}
-
-	return n, err
-}
-
-// createMultipartSSECDecryptedReader creates a decrypted reader for multipart SSE-C objects
-// Each chunk has its own IV and encryption key from the original multipart parts
-func (s3a *S3ApiServer) createMultipartSSECDecryptedReader(r *http.Request, proxyResponse *http.Response, entry *filer_pb.Entry) (io.Reader, error) {
-	ctx := r.Context()
-
-	// Parse SSE-C headers from the request for decryption key
-	customerKey, err := ParseSSECHeaders(r)
-	if err != nil {
-		return nil, fmt.Errorf("invalid SSE-C headers for multipart decryption: %v", err)
-	}
-
-	// Entry is passed from caller to avoid redundant filer lookup
-
-	// Sort chunks by offset to ensure correct order
-	chunks := entry.GetChunks()
-	sort.Slice(chunks, func(i, j int) bool {
-		return chunks[i].GetOffset() < chunks[j].GetOffset()
-	})
-
-	// Check for Range header to optimize chunk processing
-	var startOffset, endOffset int64 = 0, -1
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		// Parse range header (e.g., "bytes=0-99")
-		if len(rangeHeader) > 6 && rangeHeader[:6] == "bytes=" {
-			rangeSpec := rangeHeader[6:]
-			parts := strings.Split(rangeSpec, "-")
-			if len(parts) == 2 {
-				if parts[0] != "" {
-					startOffset, _ = strconv.ParseInt(parts[0], 10, 64)
-				}
-				if parts[1] != "" {
-					endOffset, _ = strconv.ParseInt(parts[1], 10, 64)
-				}
-			}
-		}
-	}
-
-	// Filter chunks to only those needed for the range request
-	var neededChunks []*filer_pb.FileChunk
-	for _, chunk := range chunks {
-		chunkStart := chunk.GetOffset()
-		chunkEnd := chunkStart + int64(chunk.GetSize()) - 1
-
-		// Check if this chunk overlaps with the requested range
-		if endOffset == -1 {
-			// No end specified, take all chunks from startOffset
-			if chunkEnd >= startOffset {
-				neededChunks = append(neededChunks, chunk)
-			}
-		} else {
-			// Specific range: check for overlap
-			if chunkStart <= endOffset && chunkEnd >= startOffset {
-				neededChunks = append(neededChunks, chunk)
-			}
-		}
-	}
-
-	// Create readers for only the needed chunks
-	var readers []io.Reader
-
-	for _, chunk := range neededChunks {
-
-		// Get this chunk's encrypted data
-		chunkReader, err := s3a.createEncryptedChunkReader(ctx, chunk)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create chunk reader: %v", err)
-		}
-
-		if chunk.GetSseType() == filer_pb.SSEType_SSE_C {
-			// For SSE-C chunks, extract the IV from the stored per-chunk metadata (unified approach)
-			if len(chunk.GetSseMetadata()) > 0 {
-				// Deserialize the SSE-C metadata stored in the unified metadata field
-				ssecMetadata, decErr := DeserializeSSECMetadata(chunk.GetSseMetadata())
-				if decErr != nil {
-					chunkReader.Close()
-					return nil, fmt.Errorf("failed to deserialize SSE-C metadata for chunk %s: %v", chunk.GetFileIdString(), decErr)
-				}
-
-				// Decode the IV from the metadata
-				iv, ivErr := base64.StdEncoding.DecodeString(ssecMetadata.IV)
-				if ivErr != nil {
-					chunkReader.Close()
-					return nil, fmt.Errorf("failed to decode IV for SSE-C chunk %s: %v", chunk.GetFileIdString(), ivErr)
-				}
-
-				partOffset := ssecMetadata.PartOffset
-				if partOffset < 0 {
-					chunkReader.Close()
-					return nil, fmt.Errorf("invalid SSE-C part offset %d for chunk %s", partOffset, chunk.GetFileIdString())
-				}
-
-				// Use stored IV and advance CTR stream by PartOffset within the encrypted stream
-				decryptedReader, decErr := CreateSSECDecryptedReaderWithOffset(chunkReader, customerKey, iv, uint64(partOffset))
-				if decErr != nil {
-					chunkReader.Close()
-					return nil, fmt.Errorf("failed to create SSE-C decrypted reader for chunk %s: %v", chunk.GetFileIdString(), decErr)
-				}
-				readers = append(readers, decryptedReader)
-			} else {
-				chunkReader.Close()
-				return nil, fmt.Errorf("SSE-C chunk %s missing required metadata", chunk.GetFileIdString())
-			}
-		} else {
-			// Non-SSE-C chunk, use as-is
-			readers = append(readers, chunkReader)
-		}
-	}
-
-	multiReader := NewMultipartSSEReader(readers)
-
-	// Apply range logic if a range was requested
-	if rangeHeader != "" && startOffset >= 0 {
-		if endOffset == -1 {
-			// Open-ended range (e.g., "bytes=100-")
-			return &SSERangeReader{
-				reader:    multiReader,
-				offset:    startOffset,
-				remaining: -1, // Read until EOF
-			}, nil
-		} else {
-			// Specific range (e.g., "bytes=0-99")
-			rangeLength := endOffset - startOffset + 1
-			return &SSERangeReader{
-				reader:    multiReader,
-				offset:    startOffset,
-				remaining: rangeLength,
-			}, nil
-		}
-	}
-
-	return multiReader, nil
 }
 
 // PartBoundaryInfo holds information about a part's chunk boundaries

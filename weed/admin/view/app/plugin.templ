@@ -1,19 +1,25 @@
 package app
 
-templ Plugin(page string) {
+templ Plugin(page string, initialJob string, lane string) {
     {{
         currentPage := page
         if currentPage == "" {
             currentPage = "overview"
         }
+        currentLane := lane
+        if currentLane == "" {
+            currentLane = "default"
+        }
+        laneTitle := pluginLaneTitle(currentLane)
+        laneDescription := pluginLaneDescription(currentLane)
     }}
-    <div class="container-fluid" id="plugin-page" data-plugin-page={ currentPage }>
+    <div class="container-fluid" id="plugin-page" data-plugin-page={ currentPage } data-plugin-job={ initialJob } data-plugin-lane={ currentLane }>
         <div class="row mb-4">
             <div class="col-12">
                 <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
                     <div>
-                        <h2 class="mb-0"><i class="fas fa-plug me-2"></i>Workers</h2>
-                        <p class="text-muted mb-0">Cluster-wide worker status, per-job configuration, detection, queue, and execution workflows.</p>
+                        <h2 class="mb-0"><i class="fas fa-plug me-2"></i>{ laneTitle }</h2>
+                        <p class="text-muted mb-0">{ laneDescription }</p>
                     </div>
                     <div class="btn-group">
                         <button type="button" class="btn btn-outline-secondary" id="plugin-refresh-all-btn">
@@ -239,7 +245,7 @@ templ Plugin(page string) {
                 </div>
 
                 <div class="col-lg-4 mb-3">
-                    <div class="card shadow-sm h-100">
+                    <div class="card shadow-sm">
                         <div class="card-header">
                             <h5 class="mb-0"><i class="fas fa-cogs me-2"></i>Job Scheduling Settings</h5>
                         </div>
@@ -259,6 +265,11 @@ templ Plugin(page string) {
                                 <div class="col-12">
                                     <label class="form-label" for="plugin-admin-detection-timeout">Detection Timeout (s)</label>
                                     <input type="number" class="form-control" id="plugin-admin-detection-timeout" min="0"/>
+                                </div>
+                                <div class="col-12">
+                                    <label class="form-label" for="plugin-admin-execution-timeout">Execution Timeout (s)</label>
+                                    <input type="number" class="form-control" id="plugin-admin-execution-timeout" min="0"/>
+                                    <div class="form-text">Per-attempt deadline for one job. Size-aware tasks may extend this automatically.</div>
                                 </div>
                                 <div class="col-12">
                                     <label class="form-label" for="plugin-admin-max-runtime">Job Type Max Runtime (s)</label>
@@ -584,11 +595,14 @@ templ Plugin(page string) {
                 return;
             }
 
+            var pluginLane = String(page.getAttribute('data-plugin-lane') || '').trim();
+
             var state = {
                 selectedJobType: '',
                 jobTypes: [],
                 lastDetectionByJobType: {},
                 initialPage: String(page.getAttribute('data-plugin-page') || 'overview').trim().toLowerCase(),
+                initialJob: String(page.getAttribute('data-plugin-job') || '').trim(),
                 activeTopTab: 'overview',
                 activeSubTab: 'configuration',
                 initialNavigationApplied: false,
@@ -605,6 +619,13 @@ templ Plugin(page string) {
                 config: null,
                 refreshTimer: null,
             };
+
+            // appendLaneParam appends ?lane= or &lane= to a URL if a lane filter is active.
+            function appendLaneParam(url) {
+                if (!pluginLane) return url;
+                var sep = url.indexOf('?') === -1 ? '?' : '&';
+                return url + sep + 'lane=' + encodeURIComponent(pluginLane);
+            }
 
             function getCSRFToken() {
                 var meta = document.querySelector('meta[name="csrf-token"]');
@@ -717,6 +738,30 @@ templ Plugin(page string) {
                 return 'configuration';
             }
 
+            function buildPluginURL(topTab, subTab, jobType) {
+                var laneName = pluginLane || 'default';
+                var laneBase = '/plugin/lanes/' + encodeURIComponent(laneName);
+                if (topTab === 'overview') {
+                    return laneBase;
+                }
+                var effectiveSubTab = normalizeSubTab(subTab);
+                var path = laneBase + '/' + encodeURIComponent(effectiveSubTab);
+                var jt = String(jobType || '').trim();
+                if (jt) {
+                    path += '?job=' + encodeURIComponent(jt);
+                }
+                return path;
+            }
+
+            function updateURL(replace) {
+                var url = buildPluginURL(state.activeTopTab, state.activeSubTab, state.selectedJobType);
+                if (replace) {
+                    history.replaceState({ pluginTopTab: state.activeTopTab, pluginSubTab: state.activeSubTab, pluginJob: state.selectedJobType }, '', url);
+                } else {
+                    history.pushState({ pluginTopTab: state.activeTopTab, pluginSubTab: state.activeSubTab, pluginJob: state.selectedJobType }, '', url);
+                }
+            }
+
             // Parse a job type item (string or object) into a safe object shape
             function parseJobTypeItem(item) {
                 var jobType = '';
@@ -782,8 +827,13 @@ templ Plugin(page string) {
                     state.activeTopTab = 'overview';
                     return;
                 }
-                var firstItem = parseJobTypeItem(state.jobTypes[0]);
-                state.selectedJobType = firstItem.jobType;
+                // If a specific job type was provided in the URL, use it
+                if (state.initialJob && hasJobType(state.initialJob)) {
+                    state.selectedJobType = state.initialJob;
+                } else {
+                    var firstItem = parseJobTypeItem(state.jobTypes[0]);
+                    state.selectedJobType = firstItem.jobType;
+                }
                 state.activeTopTab = topTabKeyForJobType(state.selectedJobType);
             }
 
@@ -1026,6 +1076,9 @@ templ Plugin(page string) {
                 }
 
                 var jobType = String(plan.job_type || '').trim().toLowerCase();
+                if (jobType === 'volume_balance') {
+                    return renderBalanceExecutionPlan(plan);
+                }
                 if (jobType !== 'erasure_coding') {
                     var fallbackText = toPrettyJson(plan);
                     if (!fallbackText) {
@@ -1099,6 +1152,44 @@ templ Plugin(page string) {
                             '<td>' + escapeHtml(textOrDash(assignment.target_data_center)) + '</td>' +
                             '<td>' + escapeHtml(textOrDash(assignment.target_rack)) + '</td>' +
                             '</tr>';
+                    }
+                    html += '</tbody></table></div>';
+                }
+
+                html += '</div>';
+                return html;
+            }
+
+            function renderBalanceExecutionPlan(plan) {
+                var html = '<div class="mb-3"><h6>Execution Plan</h6>';
+                var moves = Array.isArray(plan.moves) ? plan.moves : [];
+
+                if (moves.length === 0) {
+                    // Single-move balance job
+                    var src = textOrDash(plan.source_node || plan.source_server);
+                    var dst = textOrDash(plan.target_node || plan.target_server);
+                    var vid = textOrDash(plan.volume_id);
+                    var col = textOrDash(plan.collection);
+                    html += `<div class="row g-2 mb-2">
+                        <div class="col-md-3"><small><strong>Volume:</strong> ${escapeHtml(vid)}</small></div>
+                        <div class="col-md-3"><small><strong>Collection:</strong> ${escapeHtml(col)}</small></div>
+                        <div class="col-md-3"><small><strong>Source:</strong> <code>${escapeHtml(src)}</code></small></div>
+                        <div class="col-md-3"><small><strong>Target:</strong> <code>${escapeHtml(dst)}</code></small></div>
+                        </div>`;
+                } else {
+                    // Batch balance job
+                    html += '<div class="mb-2"><span class="badge bg-info">' + escapeHtml(String(moves.length)) + ' moves</span></div>';
+                    html += '<div class="table-responsive"><table class="table table-sm table-striped mb-0">' +
+                        '<thead><tr><th>#</th><th>Volume</th><th>Source</th><th>Target</th><th>Collection</th></tr></thead><tbody>';
+                    for (var i = 0; i < moves.length; i++) {
+                        var move = moves[i] || {};
+                        html += `<tr>
+                            <td>${escapeHtml(String(i + 1))}</td>
+                            <td>${escapeHtml(textOrDash(move.volume_id))}</td>
+                            <td><code>${escapeHtml(textOrDash(move.source_node))}</code></td>
+                            <td><code>${escapeHtml(textOrDash(move.target_node))}</code></td>
+                            <td>${escapeHtml(textOrDash(move.collection))}</td>
+                        </tr>`;
                     }
                     html += '</tbody></table></div>';
                 }
@@ -1676,9 +1767,15 @@ templ Plugin(page string) {
                         barClass = 'bg-warning';
                     }
 
+                    var jobTypeCell = escapeHtml(textOrDash(executionJob.job_type));
+                    var execLabels = executionJob.labels || {};
+                    if (execLabels.batch === 'true' && execLabels.batch_size) {
+                        jobTypeCell += ' <span class="badge bg-info">' + escapeHtml(execLabels.batch_size) + ' moves</span>';
+                    }
+
                     rows += '<tr>' +
                         '<td>' + renderJobLink(executionJob.job_id) + '</td>' +
-                        '<td>' + escapeHtml(textOrDash(executionJob.job_type)) + '</td>' +
+                        '<td>' + jobTypeCell + '</td>' +
                         '<td><span class="badge bg-light text-dark">' + escapeHtml(textOrDash(executionJob.state)) + '</span></td>' +
                         '<td class="plugin-job-progress"><div class="progress" style="height: 14px;"><div class="progress-bar ' + barClass + '" role="progressbar" style="width:' + progress + '%">' + Math.round(progress) + '%</div></div></td>' +
                         '<td><small>' + escapeHtml(textOrDash(executionJob.worker_id)) + '</small></td>' +
@@ -2427,6 +2524,7 @@ templ Plugin(page string) {
                 document.getElementById('plugin-admin-enabled').checked = pickBool('enabled');
                 document.getElementById('plugin-admin-detection-interval').value = String(pickNumber('detection_interval_seconds'));
                 document.getElementById('plugin-admin-detection-timeout').value = String(pickNumber('detection_timeout_seconds'));
+                document.getElementById('plugin-admin-execution-timeout').value = String(pickNumber('execution_timeout_seconds'));
                 document.getElementById('plugin-admin-max-runtime').value = String(pickNumber('job_type_max_runtime_seconds'));
                 document.getElementById('plugin-admin-max-results').value = String(pickNumber('max_jobs_per_detection'));
                 document.getElementById('plugin-admin-global-exec').value = String(pickNumber('global_execution_concurrency'));
@@ -2452,6 +2550,7 @@ templ Plugin(page string) {
                     enabled: !!document.getElementById('plugin-admin-enabled').checked,
                     detection_interval_seconds: getInt('plugin-admin-detection-interval'),
                     detection_timeout_seconds: getInt('plugin-admin-detection-timeout'),
+                    execution_timeout_seconds: getInt('plugin-admin-execution-timeout'),
                     job_type_max_runtime_seconds: getInt('plugin-admin-max-runtime'),
                     max_jobs_per_detection: getInt('plugin-admin-max-results'),
                     global_execution_concurrency: getInt('plugin-admin-global-exec'),
@@ -2840,10 +2939,10 @@ templ Plugin(page string) {
 
                 state.monitorExecutionJobState = executionStateFilter ? String(executionStateFilter.value || '').trim() : '';
 
-                var allJobsPromise = pluginRequest('GET', '/api/plugin/jobs?limit=500');
-                var allActivitiesPromise = pluginRequest('GET', '/api/plugin/activities?limit=500');
-                var schedulerPromise = pluginRequest('GET', '/api/plugin/scheduler-states');
-                var schedulerStatusPromise = pluginRequest('GET', '/api/plugin/scheduler-status');
+                var allJobsPromise = pluginRequest('GET', appendLaneParam('/api/plugin/jobs?limit=500'));
+                var allActivitiesPromise = pluginRequest('GET', appendLaneParam('/api/plugin/activities?limit=500'));
+                var schedulerPromise = pluginRequest('GET', appendLaneParam('/api/plugin/scheduler-states'));
+                var schedulerStatusPromise = pluginRequest('GET', appendLaneParam('/api/plugin/scheduler-status'));
 
                 var allJobs = await allJobsPromise;
                 var allActivities = await allActivitiesPromise;
@@ -2875,11 +2974,11 @@ templ Plugin(page string) {
                 try {
                     var previousSelectedJobType = state.selectedJobType;
 
-                    var workers = await pluginRequest('GET', '/api/plugin/workers');
+                    var workers = await pluginRequest('GET', appendLaneParam('/api/plugin/workers'));
                     state.workers = Array.isArray(workers) ? workers : [];
                     renderWorkers();
 
-                    var jobTypes = await pluginRequest('GET', '/api/plugin/job-types');
+                    var jobTypes = await pluginRequest('GET', appendLaneParam('/api/plugin/job-types'));
                     state.jobTypes = Array.isArray(jobTypes) ? jobTypes : [];
                     applyInitialNavigation();
                     ensureActiveNavigation();
@@ -2968,6 +3067,7 @@ templ Plugin(page string) {
                         if (topTabKey === 'overview') {
                             state.activeTopTab = 'overview';
                             renderNavigationState();
+                            updateURL(false);
                             return;
                         }
 
@@ -2979,6 +3079,7 @@ templ Plugin(page string) {
                         state.selectedJobType = jobType;
                         ensureActiveNavigation();
                         renderNavigationState();
+                        updateURL(false);
                         if (state.loadedJobType !== jobType) {
                             try {
                                 await loadDescriptorAndConfig(jobType, false);
@@ -3006,6 +3107,7 @@ templ Plugin(page string) {
                         var subTabKey = normalizeSubTab(subTab.getAttribute('data-plugin-subtab'));
                         state.activeSubTab = subTabKey;
                         renderNavigationState();
+                        updateURL(false);
                         return;
                     }
 
@@ -3029,10 +3131,43 @@ templ Plugin(page string) {
                 renderNavigationState();
                 await refreshAll();
 
+                // Set the initial browser history state to match the current view
+                updateURL(true);
+
                 state.refreshTimer = setInterval(function() {
                     refreshAll();
                 }, 3000);
             }
+
+            window.addEventListener('popstate', async function(event) {
+                var s = event.state;
+                if (!s || !s.pluginTopTab) {
+                    // No plugin state — treat as overview
+                    state.activeTopTab = 'overview';
+                    renderNavigationState();
+                    return;
+                }
+                state.activeTopTab = String(s.pluginTopTab || 'overview');
+                state.activeSubTab = normalizeSubTab(s.pluginSubTab);
+                var jobType = String(s.pluginJob || '').trim();
+                if (jobType) {
+                    state.selectedJobType = jobType;
+                }
+                ensureActiveNavigation();
+                renderNavigationState();
+                // If a job type is selected and not loaded yet, load it
+                if (state.selectedJobType && state.loadedJobType !== state.selectedJobType) {
+                    try {
+                        await loadDescriptorAndConfig(state.selectedJobType, false);
+                    } catch (e) {
+                        console.error('Failed to load data on popstate navigation:', e);
+                    }
+                }
+                renderQueueJobs();
+                renderDetectionJobs();
+                renderExecutionJobs();
+                renderExecutionActivities();
+            });
 
             window.addEventListener('beforeunload', function() {
                 if (state.refreshTimer) {

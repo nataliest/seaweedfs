@@ -1,7 +1,9 @@
 package weed_server
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +19,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
@@ -156,6 +160,9 @@ func (fs *FilerServer) lookupFileId(ctx context.Context, fileId string) (targetU
 func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntryRequest) (resp *filer_pb.CreateEntryResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "CreateEntry %v/%v", req.Directory, req.Entry.Name)
+	if len(req.Entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "CreateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
+	}
 
 	resp = &filer_pb.CreateEntryResponse{}
 
@@ -188,6 +195,18 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	} else {
 		glog.V(3).InfofCtx(ctx, "CreateEntry %s: %v", filepath.Join(req.Directory, req.Entry.Name), createErr)
 		resp.Error = createErr.Error()
+		switch {
+		case errors.Is(createErr, filer_pb.ErrEntryNameTooLong):
+			resp.ErrorCode = filer_pb.FilerError_ENTRY_NAME_TOO_LONG
+		case errors.Is(createErr, filer_pb.ErrParentIsFile):
+			resp.ErrorCode = filer_pb.FilerError_PARENT_IS_FILE
+		case errors.Is(createErr, filer_pb.ErrExistingIsDirectory):
+			resp.ErrorCode = filer_pb.FilerError_EXISTING_IS_DIRECTORY
+		case errors.Is(createErr, filer_pb.ErrExistingIsFile):
+			resp.ErrorCode = filer_pb.FilerError_EXISTING_IS_FILE
+		case errors.Is(createErr, filer_pb.ErrEntryAlreadyExists):
+			resp.ErrorCode = filer_pb.FilerError_ENTRY_ALREADY_EXISTS
+		}
 	}
 
 	return
@@ -196,11 +215,17 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "UpdateEntry %v", req)
+	if len(req.Entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "UpdateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
+	}
 
 	fullpath := util.Join(req.Directory, req.Entry.Name)
 	entry, err := fs.filer.FindEntry(ctx, util.FullPath(fullpath))
 	if err != nil {
 		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("not found %s: %v", fullpath, err)
+	}
+	if err := validateUpdateEntryPreconditions(entry, req.ExpectedExtended); err != nil {
+		return &filer_pb.UpdateEntryResponse{}, err
 	}
 
 	chunks, garbage, err2 := fs.cleanupChunks(ctx, fullpath, entry, req.Entry)
@@ -233,6 +258,31 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	}
 
 	return resp, err
+}
+
+func validateUpdateEntryPreconditions(entry *filer.Entry, expectedExtended map[string][]byte) error {
+	if len(expectedExtended) == 0 {
+		return nil
+	}
+
+	for key, expectedValue := range expectedExtended {
+		var actualValue []byte
+		var ok bool
+		if entry != nil {
+			actualValue, ok = entry.Extended[key]
+		}
+		if ok {
+			if !bytes.Equal(actualValue, expectedValue) {
+				return status.Errorf(codes.FailedPrecondition, "extended attribute %q changed", key)
+			}
+			continue
+		}
+		if len(expectedValue) > 0 {
+			return status.Errorf(codes.FailedPrecondition, "extended attribute %q changed", key)
+		}
+	}
+
+	return nil
 }
 
 func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, existingEntry *filer.Entry, newEntry *filer_pb.Entry) (chunks, garbage []*filer_pb.FileChunk, err error) {
@@ -338,17 +388,17 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 
 func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVolumeRequest) (resp *filer_pb.AssignVolumeResponse, err error) {
 
-	if req.DiskType == "" {
-		req.DiskType = fs.option.DiskType
-	}
-
-	so, err := fs.detectStorageOption(ctx, req.Path, req.Collection, req.Replication, req.TtlSec, req.DiskType, req.DataCenter, req.Rack, req.DataNode)
+	so, err := fs.resolveAssignStorageOption(ctx, req)
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "AssignVolume: %v", err)
 		return &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume: %v", err)}, nil
 	}
 
 	assignRequest, altRequest := so.ToAssignRequests(int(req.Count))
+	assignRequest.ExpectedDataSize = req.ExpectedDataSize
+	if altRequest != nil {
+		altRequest.ExpectedDataSize = req.ExpectedDataSize
+	}
 
 	assignResult, err := operation.Assign(ctx, fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)
 	if err != nil {
@@ -372,6 +422,21 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 		Collection:  so.Collection,
 		Replication: so.Replication,
 	}, nil
+}
+
+func (fs *FilerServer) resolveAssignStorageOption(ctx context.Context, req *filer_pb.AssignVolumeRequest) (*operation.StorageOption, error) {
+	so, err := fs.detectStorageOption(ctx, req.Path, req.Collection, req.Replication, req.TtlSec, req.DiskType, req.DataCenter, req.Rack, req.DataNode)
+	if err != nil {
+		return nil, err
+	}
+
+	// Mirror the HTTP write path: only apply the filer's default disk when the
+	// matched locationPrefix rule did not already select one.
+	if so.DiskType == "" {
+		so.DiskType = fs.option.DiskType
+	}
+
+	return so, nil
 }
 
 func (fs *FilerServer) CollectionList(ctx context.Context, req *filer_pb.CollectionListRequest) (resp *filer_pb.CollectionListResponse, err error) {

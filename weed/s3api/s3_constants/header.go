@@ -29,6 +29,11 @@ const (
 	S3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 )
 
+// S3 object key limits
+const (
+	MaxS3ObjectKeyLength = 1024
+)
+
 // Standard S3 HTTP request constants
 const (
 	// S3 storage class
@@ -70,6 +75,16 @@ const (
 	AmzObjectLockMode            = "X-Amz-Object-Lock-Mode"
 	AmzObjectLockRetainUntilDate = "X-Amz-Object-Lock-Retain-Until-Date"
 	AmzObjectLockLegalHold       = "X-Amz-Object-Lock-Legal-Hold"
+
+	// S3 checksum headers
+	AmzChecksumAlgorithm    = "X-Amz-Checksum-Algorithm"
+	AmzChecksumCRC32        = "X-Amz-Checksum-Crc32"
+	AmzChecksumCRC32C       = "X-Amz-Checksum-Crc32c"
+	AmzChecksumCRC64NVME    = "X-Amz-Checksum-Crc64nvme"
+	AmzChecksumSHA1         = "X-Amz-Checksum-Sha1"
+	AmzChecksumSHA256       = "X-Amz-Checksum-Sha256"
+	AmzTrailer              = "X-Amz-Trailer"
+	AmzSdkChecksumAlgorithm = "X-Amz-Sdk-Checksum-Algorithm"
 
 	// S3 conditional headers
 	IfMatch           = "If-Match"
@@ -135,25 +150,6 @@ const (
 	SeaweedFSSSES3BaseIVHeader  = "X-SeaweedFS-SSE-S3-Base-IV"  // Header for passing base IV for multipart SSE-S3
 	SeaweedFSSSES3KeyDataHeader = "X-SeaweedFS-SSE-S3-Key-Data" // Header for passing key data for multipart SSE-S3
 )
-
-// S3 Additional Checksum headers (used for storing/returning checksums)
-const (
-	AmzChecksumCRC32    = "x-amz-checksum-crc32"
-	AmzChecksumCRC32C   = "x-amz-checksum-crc32c"
-	AmzChecksumCRC64NVME = "x-amz-checksum-crc64nvme"
-	AmzChecksumSHA1     = "x-amz-checksum-sha1"
-	AmzChecksumSHA256   = "x-amz-checksum-sha256"
-	AmzChecksumMode     = "X-Amz-Checksum-Mode"
-)
-
-// S3ChecksumHeaders lists all S3 Additional Checksum header keys (lowercase).
-var S3ChecksumHeaders = []string{
-	AmzChecksumCRC32,
-	AmzChecksumCRC32C,
-	AmzChecksumCRC64NVME,
-	AmzChecksumSHA1,
-	AmzChecksumSHA256,
-}
 
 // Non-Standard S3 HTTP request constants
 const (

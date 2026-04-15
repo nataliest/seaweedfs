@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/test/testutil"
 	"github.com/seaweedfs/seaweedfs/test/volume_server/matrix"
 )
 
@@ -25,6 +26,12 @@ const (
 	defaultWaitTimeout    = 30 * time.Second
 	defaultWaitTick       = 200 * time.Millisecond
 	testVolumeSizeLimitMB = 32
+)
+
+var (
+	weedBinaryOnce sync.Once
+	weedBinaryPath string
+	weedBinaryErr  error
 )
 
 // Cluster is a lightweight SeaweedFS master + one volume server test harness.
@@ -78,12 +85,14 @@ func StartSingleVolumeCluster(t testing.TB, profile matrix.Profile) *Cluster {
 		t.Fatalf("write security config: %v", err)
 	}
 
-	masterPort, masterGrpcPort, err := allocateMasterPortPair()
+	miniPorts, err := testutil.AllocateMiniPorts(1)
 	if err != nil {
 		t.Fatalf("allocate master port pair: %v", err)
 	}
+	masterPort := miniPorts[0]
+	masterGrpcPort := masterPort + testutil.GrpcPortOffset
 
-	ports, err := allocatePorts(3)
+	ports, err := testutil.AllocatePorts(3)
 	if err != nil {
 		t.Fatalf("allocate ports: %v", err)
 	}
@@ -263,45 +272,6 @@ func stopProcess(cmd *exec.Cmd) {
 	}
 }
 
-func allocatePorts(count int) ([]int, error) {
-	listeners := make([]net.Listener, 0, count)
-	ports := make([]int, 0, count)
-	for i := 0; i < count; i++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			for _, ll := range listeners {
-				_ = ll.Close()
-			}
-			return nil, err
-		}
-		listeners = append(listeners, l)
-		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
-	}
-	for _, l := range listeners {
-		_ = l.Close()
-	}
-	return ports, nil
-}
-
-func allocateMasterPortPair() (int, int, error) {
-	for masterPort := 10000; masterPort <= 55535; masterPort++ {
-		masterGrpcPort := masterPort + 10000
-		l1, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(masterPort)))
-		if err != nil {
-			continue
-		}
-		l2, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(masterGrpcPort)))
-		if err != nil {
-			_ = l1.Close()
-			continue
-		}
-		_ = l2.Close()
-		_ = l1.Close()
-		return masterPort, masterGrpcPort, nil
-	}
-	return 0, 0, errors.New("unable to find available master port pair")
-}
-
 func newWorkDir() (dir string, keepLogs bool, err error) {
 	keepLogs = os.Getenv("VOLUME_SERVER_IT_KEEP_LOGS") == "1"
 	dir, err = os.MkdirTemp("", "seaweedfs_volume_server_it_")
@@ -326,6 +296,13 @@ func writeSecurityConfig(configDir string, profile matrix.Profile) error {
 		b.WriteString("\"\n")
 		b.WriteString("expires_after_seconds = 60\n")
 	}
+	if profile.EnableUIAccess {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("[access]\n")
+		b.WriteString("ui = true\n")
+	}
 	if b.Len() == 0 {
 		b.WriteString("# optional security config generated for integration tests\n")
 	}
@@ -341,40 +318,43 @@ func FindOrBuildWeedBinary() (string, error) {
 		return "", fmt.Errorf("WEED_BINARY is set but not executable: %s", fromEnv)
 	}
 
-	repoRoot := ""
-	if _, file, _, ok := runtime.Caller(0); ok {
-		repoRoot = filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
-		candidate := filepath.Join(repoRoot, "weed", "weed")
-		if isExecutableFile(candidate) {
-			return candidate, nil
+	weedBinaryOnce.Do(func() {
+		repoRoot := ""
+		if _, file, _, ok := runtime.Caller(0); ok {
+			repoRoot = filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
 		}
-	}
+		if repoRoot == "" {
+			weedBinaryErr = errors.New("unable to detect repository root")
+			return
+		}
 
-	if repoRoot == "" {
-		return "", errors.New("unable to detect repository root")
-	}
+		binDir := filepath.Join(os.TempDir(), "seaweedfs_volume_server_it_bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			weedBinaryErr = fmt.Errorf("create binary directory %s: %w", binDir, err)
+			return
+		}
+		binPath := filepath.Join(binDir, "weed")
 
-	binDir := filepath.Join(os.TempDir(), "seaweedfs_volume_server_it_bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		return "", fmt.Errorf("create binary directory %s: %w", binDir, err)
-	}
-	binPath := filepath.Join(binDir, "weed")
-	if isExecutableFile(binPath) {
-		return binPath, nil
-	}
+		cmd := exec.Command("go", "build", "-o", binPath, ".")
+		cmd.Dir = filepath.Join(repoRoot, "weed")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Run(); err != nil {
+			weedBinaryErr = fmt.Errorf("build weed binary: %w\n%s", err, out.String())
+			return
+		}
+		if !isExecutableFile(binPath) {
+			weedBinaryErr = fmt.Errorf("built weed binary is not executable: %s", binPath)
+			return
+		}
+		weedBinaryPath = binPath
+	})
 
-	cmd := exec.Command("go", "build", "-o", binPath, ".")
-	cmd.Dir = filepath.Join(repoRoot, "weed")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("build weed binary: %w\n%s", err, out.String())
+	if weedBinaryErr != nil {
+		return "", weedBinaryErr
 	}
-	if !isExecutableFile(binPath) {
-		return "", fmt.Errorf("built weed binary is not executable: %s", binPath)
-	}
-	return binPath, nil
+	return weedBinaryPath, nil
 }
 
 func isExecutableFile(path string) bool {

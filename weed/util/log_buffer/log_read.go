@@ -18,6 +18,15 @@ var (
 	ResumeFromDiskError = fmt.Errorf("resumeFromDisk")
 )
 
+// notificationHealthCheckInterval bounds how long an idle subscriber blocks
+// on the notification channel before re-checking state (client disconnect via
+// waitForDataFn, LogBuffer shutdown, timestamp advancement). notifyChan is the
+// primary wakeup path when new data arrives or a flush lands; this timeout is
+// the safety net for any missed notification and also caps the latency to
+// notice that the subscriber should exit. Balances idle CPU and log noise
+// against client-disconnect detection latency.
+const notificationHealthCheckInterval = 250 * time.Millisecond
+
 type MessagePosition struct {
 	Time          time.Time // timestamp of the message
 	Offset        int64     // Kafka offset for offset-based positioning, or batch index for timestamp-based
@@ -49,6 +58,26 @@ func (mp MessagePosition) GetOffset() int64 {
 	return mp.Offset // Offset is stored directly
 }
 
+// awaitNotificationOrTimeout blocks until one of:
+//   - a new-data / flush notification arrives on notifyChan (returns true)
+//   - the LogBuffer is shut down via ShutdownLogBuffer (returns true; callers
+//     re-check IsStopping() and exit)
+//   - notificationHealthCheckInterval elapses (returns false; caller
+//     re-checks client-disconnect and other state)
+func (logBuffer *LogBuffer) awaitNotificationOrTimeout(notifyChan <-chan struct{}) bool {
+	timer := time.NewTimer(notificationHealthCheckInterval)
+	defer timer.Stop()
+
+	select {
+	case <-notifyChan:
+		return true
+	case <-logBuffer.shutdownCh:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition MessagePosition, stopTsNs int64,
 	waitForDataFn func() bool, eachLogDataFn EachLogEntryFuncType) (lastReadPosition MessagePosition, isDone bool, err error) {
 
@@ -77,6 +106,7 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 		if err == ResumeFromDiskError {
 			// Try to read from disk if readFromDiskFn is available
 			if logBuffer.ReadFromDiskFn != nil {
+				prevReadPosition := lastReadPosition
 				lastReadPosition, isDone, err = logBuffer.ReadFromDiskFn(lastReadPosition, stopTsNs, eachLogDataFn)
 				if err != nil {
 					return lastReadPosition, isDone, err
@@ -84,6 +114,11 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 				if isDone {
 					return lastReadPosition, isDone, nil
 				}
+				if lastReadPosition != prevReadPosition {
+					continue
+				}
+			} else if logBuffer.HasData() {
+				return lastReadPosition, isDone, ResumeFromDiskError
 			}
 
 			// CRITICAL: Check if client is still connected
@@ -94,13 +129,19 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 			}
 
 			// Wait for notification or timeout (instant wake-up when data arrives)
-			select {
-			case <-notifyChan:
-				// New data available, retry immediately
+			if logBuffer.awaitNotificationOrTimeout(notifyChan) {
 				glog.V(3).Infof("%s: Woke up from notification after ResumeFromDiskError", readerName)
-			case <-time.After(10 * time.Millisecond):
-				// Timeout, retry anyway (fallback for edge cases)
-				glog.V(4).Infof("%s: Notification timeout after ResumeFromDiskError, polling", readerName)
+			} else {
+				glog.V(4).Infof("%s: Notification timeout after ResumeFromDiskError, rechecking state", readerName)
+			}
+
+			// If the LogBuffer is shutting down, exit cleanly instead of looping
+			// on ResumeFromDiskError. awaitNotificationOrTimeout returns true on
+			// shutdown (shutdownCh closed), which would otherwise spin here
+			// because ReadFromBuffer keeps returning ResumeFromDiskError.
+			if logBuffer.IsStopping() {
+				isDone = true
+				return
 			}
 
 			// Continue to next iteration (don't return ResumeFromDiskError)
@@ -137,17 +178,18 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 					return
 				}
 				// Wait for notification or timeout (instant wake-up when data arrives)
-				select {
-				case <-notifyChan:
-					// New data available, break and retry read
+				if logBuffer.awaitNotificationOrTimeout(notifyChan) {
 					glog.V(3).Infof("%s: Woke up from notification (LoopProcessLogData)", readerName)
+				} else if lastTsNs != logBuffer.LastTsNs.Load() {
 					break
-				case <-time.After(10 * time.Millisecond):
-					// Timeout, check if timestamp changed
-					if lastTsNs != logBuffer.LastTsNs.Load() {
-						break
-					}
-					glog.V(4).Infof("%s: Notification timeout (LoopProcessLogData), polling", readerName)
+				} else {
+					glog.V(4).Infof("%s: Notification timeout (LoopProcessLogData), rechecking state", readerName)
+				}
+				// Exit the wait loop on shutdown so we don't spin against a
+				// closed shutdownCh.
+				if logBuffer.IsStopping() {
+					isDone = true
+					return
 				}
 			}
 			if logBuffer.IsStopping() {
@@ -261,6 +303,7 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 		if err == ResumeFromDiskError {
 			// Try to read from disk if readFromDiskFn is available
 			if logBuffer.ReadFromDiskFn != nil {
+				prevReadPosition := lastReadPosition
 				// Wrap eachLogDataFn to match the expected signature
 				diskReadFn := func(logEntry *filer_pb.LogEntry) (bool, error) {
 					return eachLogDataFn(logEntry, logEntry.Offset)
@@ -272,7 +315,11 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 				if isDone {
 					return lastReadPosition, isDone, nil
 				}
-				// Continue to next iteration after disk read
+				if lastReadPosition != prevReadPosition {
+					continue
+				}
+			} else if logBuffer.HasData() {
+				return lastReadPosition, isDone, ResumeFromDiskError
 			}
 
 			// CRITICAL: Check if client is still connected after disk read
@@ -283,13 +330,15 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 			}
 
 			// Wait for notification or timeout (instant wake-up when data arrives)
-			select {
-			case <-notifyChan:
-				// New data available, retry immediately
+			if logBuffer.awaitNotificationOrTimeout(notifyChan) {
 				glog.V(3).Infof("%s: Woke up from notification after disk read", readerName)
-			case <-time.After(10 * time.Millisecond):
-				// Timeout, retry anyway (fallback for edge cases)
-				glog.V(4).Infof("%s: Notification timeout, polling", readerName)
+			} else {
+				glog.V(4).Infof("%s: Notification timeout, rechecking state", readerName)
+			}
+
+			// Exit cleanly on shutdown so we don't loop on ResumeFromDiskError.
+			if logBuffer.IsStopping() {
+				return lastReadPosition, true, nil
 			}
 
 			// Continue to next iteration (don't return ResumeFromDiskError)
@@ -327,13 +376,14 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 					return lastReadPosition, true, nil
 				}
 				// Wait for notification or timeout (instant wake-up when data arrives)
-				select {
-				case <-notifyChan:
-					// New data available, retry immediately
+				if logBuffer.awaitNotificationOrTimeout(notifyChan) {
 					glog.V(3).Infof("%s: Woke up from notification for offset-based read", readerName)
-				case <-time.After(10 * time.Millisecond):
-					// Timeout, retry anyway (fallback for edge cases)
-					glog.V(4).Infof("%s: Notification timeout for offset-based, polling", readerName)
+				} else {
+					glog.V(4).Infof("%s: Notification timeout for offset-based, rechecking state", readerName)
+				}
+				// On shutdown, exit cleanly instead of returning ResumeFromDiskError.
+				if logBuffer.IsStopping() {
+					return lastReadPosition, true, nil
 				}
 				return lastReadPosition, isDone, ResumeFromDiskError
 			}
@@ -346,17 +396,18 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 					return lastReadPosition, true, nil
 				}
 				// Wait for notification or timeout (instant wake-up when data arrives)
-				select {
-				case <-notifyChan:
-					// New data available, break and retry read
+				if logBuffer.awaitNotificationOrTimeout(notifyChan) {
 					glog.V(3).Infof("%s: Woke up from notification (main loop)", readerName)
+				} else if lastTsNs != logBuffer.LastTsNs.Load() {
 					break
-				case <-time.After(10 * time.Millisecond):
-					// Timeout, check if timestamp changed
-					if lastTsNs != logBuffer.LastTsNs.Load() {
-						break
-					}
-					glog.V(4).Infof("%s: Notification timeout (main loop), polling", readerName)
+				} else {
+					glog.V(4).Infof("%s: Notification timeout (main loop), rechecking state", readerName)
+				}
+				// Exit the wait loop on shutdown so we don't spin against a
+				// closed shutdownCh.
+				if logBuffer.IsStopping() {
+					glog.V(4).Infof("%s: LogBuffer is stopping", readerName)
+					return lastReadPosition, true, nil
 				}
 			}
 			if logBuffer.IsStopping() {
@@ -377,8 +428,15 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 				glog.V(4).Infof("%s: Client disconnected on empty buffer", readerName)
 				return lastReadPosition, true, nil
 			}
-			// Sleep to avoid busy-wait on empty buffer
-			time.Sleep(10 * time.Millisecond)
+			if logBuffer.awaitNotificationOrTimeout(notifyChan) {
+				glog.V(3).Infof("%s: Woke up from notification on empty buffer", readerName)
+			} else {
+				glog.V(4).Infof("%s: Empty buffer timeout, rechecking state", readerName)
+			}
+			// Exit cleanly on shutdown to avoid an idle spin on the empty buffer.
+			if logBuffer.IsStopping() {
+				return lastReadPosition, true, nil
+			}
 			continue
 		}
 

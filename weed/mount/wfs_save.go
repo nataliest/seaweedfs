@@ -15,23 +15,20 @@ func (wfs *WFS) saveEntry(path util.FullPath, entry *filer_pb.Entry) (code fuse.
 
 	parentDir, _ := path.DirAndName()
 
-	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	wfs.mapPbIdFromLocalToFiler(entry)
+	defer wfs.mapPbIdFromFilerToLocal(entry)
 
-		wfs.mapPbIdFromLocalToFiler(entry)
-		defer wfs.mapPbIdFromFilerToLocal(entry)
+	request := &filer_pb.UpdateEntryRequest{
+		Directory:  parentDir,
+		Entry:      entry,
+		Signatures: []int32{wfs.signature},
+	}
 
-		request := &filer_pb.UpdateEntryRequest{
-			Directory:  parentDir,
-			Entry:      entry,
-			Signatures: []int32{wfs.signature},
-		}
-
-		glog.V(1).Infof("save entry: %v", request)
-		resp, err := filer_pb.UpdateEntryWithResponse(context.Background(), client, request)
-		if err != nil {
-			return fmt.Errorf("UpdateEntry dir %s: %v", path, err)
-		}
-
+	glog.V(1).Infof("save entry: %v", request)
+	resp, err := wfs.streamUpdateEntry(context.Background(), request)
+	if err != nil {
+		err = fmt.Errorf("UpdateEntry dir %s: %v", path, err)
+	} else {
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataUpdateEvent(parentDir, entry)
@@ -40,9 +37,7 @@ func (wfs *WFS) saveEntry(path util.FullPath, entry *filer_pb.Entry) (code fuse.
 			glog.Warningf("saveEntry %s: best-effort metadata apply failed: %v", path, applyErr)
 			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(parentDir))
 		}
-
-		return nil
-	})
+	}
 	if err != nil {
 		// glog.V(0).Infof("saveEntry %s: %v", path, err)
 		fuseStatus := grpcErrorToFuseStatus(err)
@@ -71,7 +66,10 @@ func (wfs *WFS) mapPbIdFromLocalToFiler(entry *filer_pb.Entry) {
 }
 
 func checkName(name string) fuse.Status {
-	if len(name) >= 4096 {
+	// The Linux FUSE kernel module enforces NAME_MAX=255 at the VFS layer.
+	// Return ENAMETOOLONG early to avoid creating entries that cannot be
+	// looked up via normal syscalls (stat, chmod, etc.).
+	if len(name) > 255 {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
 	return fuse.OK
